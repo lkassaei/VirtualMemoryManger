@@ -25,6 +25,14 @@
 // ?? var_name = gives value of that variable
 // x = see list of globals
 
+// Performance trace cheat sheet
+// xperf -on base -stackwalk profile
+// Then run your program
+// xperf -stop -d trace1.etl
+// trace1.etl
+// Once in the trace, click Trace and then Load Symbols
+
+
 
 
 #include <stdio.h>
@@ -229,14 +237,21 @@ typedef struct {
     ULONG64 isOccupied: 2; // 00 = free, 01 = active, 10 = modified, 11 = standby
 } pfn_metadata;
 
+LIST_ENTRY pfn_free_list;
 LIST_ENTRY pfn_active_list;
 LIST_ENTRY pfn_modified_list;
 LIST_ENTRY pfn_standby_list;
 
 // LK make constants for pfn states and fix
 
+
+
+// An array of pointers directly mapping a hardware frame number to its metadata block
+pfn_metadata* frame_to_pfn_table = NULL;
+ULONG64 max_frame_number = 0;
+
 // This array represents our physical memory slots
-pfn_metadata physical_pool[NUMBER_OF_PHYSICAL_PAGES] = { 0 };
+//pfn_metadata physical_pool[NUMBER_OF_PHYSICAL_PAGES] = { 0 };
 
 // Inline helper to back-step from a List Entry pointer to the metadata struct
 pfn_metadata*
@@ -245,29 +260,40 @@ GetPfnFromListEntry(PLIST_ENTRY entry) {
     return CONTAINING_RECORD(entry, pfn_metadata, list);
 }
 
-pfn_metadata*
-find_pfn_from_frame_number(ULONG64 frame_number, int physical_page_count) {
-    int count = 0;
-    for (int i = 0; i < physical_page_count; i++) {
-        if (physical_pool[i].frame_number
-        == frame_number) {
-            return &physical_pool[i];
-        }
-        count++;
-    }
-    ASSERT(count != NUMBER_OF_PHYSICAL_PAGES);
-    return NULL;
-}
+
 
 VOID
-setup_pfn_metadata(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers) {
-    // Clear pool metadata states explicitly
-    for (int j = 0; j < physical_page_count; j++) {
-        physical_pool[j].frame_number = physical_page_numbers[j];
-        physical_pool[j].isOccupied = 0; // 0 = Clean/Free
-        physical_pool[j].pte = NULL;
-        InitializeListHead(&physical_pool[j].list);
+ensure_metadata_slot_is_committed(pfn_metadata* table_base, ULONG64 frame_number) {
+    // 1. Get the exact byte addresses of where this specific struct starts and ends
+    ULONG_PTR struct_start_va = (ULONG_PTR)&table_base[frame_number];
+    ULONG_PTR struct_end_va   = struct_start_va + sizeof(pfn_metadata) - 1;
+
+    // 2. Calculate the page tracking numbers for both ends
+    ULONG_PTR start_page = struct_start_va / PAGE_SIZE;
+    ULONG_PTR end_page   = struct_end_va / PAGE_SIZE;
+
+    // 3. Determine how many bytes we need to commit (either 1 page or 2 pages)
+    ULONG_PTR pages_to_commit = (end_page - start_page) + 1;
+    ULONG_PTR bytes_to_commit = pages_to_commit * PAGE_SIZE;
+
+    // 4. Align the starting address down to the absolute page boundary for VirtualAlloc
+    PVOID page_aligned_address = (PVOID)(struct_start_va & ~(PAGE_SIZE - 1));
+
+    // 5. Commit the page(s)
+    if (VirtualAlloc(page_aligned_address, bytes_to_commit, MEM_COMMIT, PAGE_READWRITE) == NULL) {
+        printf("CRITICAL: Failed to commit metadata pages for frame %llu. Error: %lu\n",
+               frame_number, GetLastError());
+        DebugBreak();
     }
+}
+
+pfn_metadata*
+find_pfn_from_frame_number(ULONG64 frame_number, int physical_page_count) {
+    if (frame_number <= max_frame_number) {
+        //ensure_metadata_slot_is_committed(frame_to_pfn_table, frame_number);
+        return &frame_to_pfn_table[frame_number];
+    }
+    return NULL;
 }
 
 PVOID
@@ -279,6 +305,48 @@ zero_malloc(size_t num_bytes) {
     memset(p, 0, num_bytes);
     return p;
 }
+
+VOID
+setup_pfn_metadata(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers) {
+    // 1. Scan the assigned PFN numbers to find the highest token boundary
+    for (int j = 0; j < physical_page_count; j++) {
+        if (physical_page_numbers[j] > max_frame_number) {
+            max_frame_number = physical_page_numbers[j];
+        }
+    }
+
+    // Calculate total virtual address space size needed to bridge 0 to max_frame_number
+    ULONG_PTR table_reserve_size = (max_frame_number + 1) * sizeof(pfn_metadata);
+
+    // 2. MEM_RESERVE and MEM_COMMIT the entire virtual footprint in ONE system call!
+    // VirtualAlloc automatically rounds table_reserve_size up to the next PAGE_SIZE boundary,
+    // completely eliminating any struct-straddling memory access violations.
+    frame_to_pfn_table = (pfn_metadata*)VirtualAlloc(
+        NULL,
+        table_reserve_size,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE
+    );
+
+    if (frame_to_pfn_table == NULL) {
+        printf("CRITICAL: Failed to reserve and commit tracking table. Error: %lu\n", GetLastError());
+        DebugBreak();
+        return;
+    }
+
+    // 3. Populate base physical pool structures without any kernel syscall overhead
+    for (int j = 0; j < physical_page_count; j++) {
+        ULONG64 frame = physical_page_numbers[j];
+
+        // Accessing the struct is now 100% safe; the memory is fully backed by RAM
+        frame_to_pfn_table[frame].frame_number = frame;
+        frame_to_pfn_table[frame].isOccupied = 0;
+        InitializeListHead(&frame_to_pfn_table[frame].list);
+
+        InsertTailList(&pfn_free_list, &frame_to_pfn_table[frame].list);
+    }
+}
+
 
 PULONG_PTR va_start;
 
@@ -317,14 +385,11 @@ increment_pte_age(PVALID_PTE pte) {
 
 pfn_metadata*
 get_free_page() {
-    pfn_metadata* target_pfn = NULL;
-    for (int j = 0; j < NUMBER_OF_PHYSICAL_PAGES; j++) {
-        if (physical_pool[j].isOccupied == 0) {
-            target_pfn = &physical_pool[j];
-            break;
-        }
+    if (!IsListEmpty(&pfn_free_list)) {
+        PLIST_ENTRY entry = RemoveHeadList(&pfn_free_list);
+        return GetPfnFromListEntry(entry);
     }
-    return target_pfn;
+    return NULL;
 }
 
 VOID
@@ -376,78 +441,99 @@ int find_free_disc_slot(int disc_page_count) {
 }
 
 VOID
-get_unmap_candidates(int* batch_count, int batch_size,
+get_unmap_candidates_and_save_to_disc(int* batch_count, int batch_size,
     ULONG_PTR physical_page_count, PULONG_PTR* unmap_batch,
     ULONG64 disc_page_count, PVOID disc) {
-    while (*batch_count < batch_size) {
-        int oldest_slot = -1;
-        ULONG64 highest_age = 0;
 
-        // Scan specifically for live, ACTIVE (1) frames to find the oldest
-        for (int j = 0; j < physical_page_count; j++) {
-            if (physical_pool[j].isOccupied == 1 && physical_pool[j].pte != NULL) {
-                ULONG64 current_age = physical_pool[j].pte->hardware.age;
+    PLIST_ENTRY link = pfn_active_list.Flink;
 
-                if (current_age >= highest_age) {
-                    PULONG_PTR candidate_va = get_va_from_pte(physical_pool[j].pte);
-                    BOOL already_batched = FALSE;
-                    for (int k = 0; k < *batch_count; k++) {
-                        if (unmap_batch[k] == candidate_va) {
-                            already_batched = TRUE;
-                            break;
+    // Do exactly ONE pass through the list.
+    while (link != &pfn_active_list && *batch_count < batch_size) {
+        pfn_metadata* candidate = GetPfnFromListEntry(link);
+
+        // IMPORTANT: Save the next link BEFORE we potentially remove the current node!
+        PLIST_ENTRY next_link = link->Flink;
+
+        if (candidate->isOccupied == 1 && candidate->pte != NULL) {
+
+            // If age > 0, it hasn't been touched recently. Harvest it!
+            if (candidate->pte->hardware.age > 0) {
+                PPTE evict_pte = candidate->pte;
+                PULONG_PTR evict_va = get_va_from_pte(evict_pte);
+
+                // Add to our batch
+                unmap_batch[*batch_count] = evict_va;
+                (*batch_count)++;
+
+                // 1. Remove from active list
+                RemoveEntryList(&candidate->list);
+
+                // 2. Move to MODIFIED state
+                candidate->isOccupied = 2;
+                InsertTailList(&pfn_modified_list, &candidate->list);
+
+                // 3. Find disc slot and transfer data
+                int disc_slot = find_free_disc_slot(disc_page_count);
+                if (disc_slot != -1) {
+                    void* disc_address = (char*)disc + (disc_slot * PAGE_SIZE);
+                    memcpy(disc_address, (void*)evict_va, PAGE_SIZE);
+
+                    // Mark software PTE as on disk
+                    evict_pte->hardware.valid = 0;
+                    evict_pte->disc.transition = 0;
+                    evict_pte->disc.disc = 1;
+                    evict_pte->disc.disc_index = disc_slot;
+
+                    candidate->disc_index = disc_slot;
+                } else {
+                    printf("CRITICAL: Swap space exhaustion during trim phase!\n");
+                    return;
+                }
+            }
+
+            // FALLBACK: If the graceful sweep found nothing because all ages are 0,
+            // we must force-evict from the head of the list (FIFO) to survive!
+            if (*batch_count == 0) {
+                link = pfn_active_list.Flink;
+                while (link != &pfn_active_list && *batch_count < batch_size) {
+                    pfn_metadata* candidate = GetPfnFromListEntry(link);
+                    PLIST_ENTRY next_link = link->Flink;
+
+                    if (candidate->isOccupied == 1 && candidate->pte != NULL) {
+                        PPTE evict_pte = candidate->pte;
+                        PULONG_PTR evict_va = get_va_from_pte(evict_pte);
+
+                        unmap_batch[*batch_count] = evict_va;
+                        (*batch_count)++;
+
+                        RemoveEntryList(&candidate->list);
+                        candidate->isOccupied = 2;
+                        InsertTailList(&pfn_modified_list, &candidate->list);
+
+                        int disc_slot = find_free_disc_slot(disc_page_count);
+                        if (disc_slot != -1) {
+                            void* disc_address = (char*)disc + (disc_slot * PAGE_SIZE);
+                            memcpy(disc_address, (void*)evict_va, PAGE_SIZE);
+
+                            evict_pte->hardware.valid = 0;
+                            evict_pte->disc.transition = 0;
+                            evict_pte->disc.disc = 1;
+                            evict_pte->disc.disc_index = disc_slot;
+                            candidate->disc_index = disc_slot;
+                        } else {
+                            printf("CRITICAL: Absolute swap space exhaustion!\n");
+                            return;
                         }
                     }
-
-                    if (!already_batched) {
-                        highest_age = current_age;
-                        oldest_slot = j;
-                    }
+                    link = next_link;
                 }
             }
         }
 
-        // Transition the chosen old page into the Modified state because we will unmap
-        if (oldest_slot != -1) {
-            pfn_metadata* evict_pfn = &physical_pool[oldest_slot];
-            PPTE evict_pte = evict_pfn->pte;
-            PULONG_PTR evict_va = get_va_from_pte(evict_pte);
-
-            unmap_batch[*batch_count] = evict_va;
-            (*batch_count)++;
-
-            // Remove from active list tracking
-            RemoveEntryList(&evict_pfn->list);
-
-            // Move to MODIFIED state and list (Marked as trimmed, but data not yet written)
-            evict_pfn->isOccupied = 2;
-            InsertTailList(&pfn_modified_list, &evict_pfn->list);
-
-            // Find disc slot to transfer that data to later
-            int disc_slot = find_free_disc_slot(disc_page_count);
-            if (disc_slot != -1) {
-                // Get disc address
-                void* disc_address = (char*)disc + (disc_slot * PAGE_SIZE);
-
-                // Copy data while physical mapping is fully valid and readable
-                memcpy(disc_address, (void*)evict_va, PAGE_SIZE);
-
-                // Mark software PTE as an invalid transition entry pointing to the disk index
-                evict_pte->hardware.valid = 0;
-                evict_pte->disc.transition = 0;
-                evict_pte->disc.disc = 1;
-                evict_pte->disc.disc_index = disc_slot;
-
-                evict_pfn->disc_index = disc_slot;
-            } else {
-                printf("CRITICAL: Swap space exhaustion during trim phase!\n");
-                return;
-            }
-        } else {
-            break;
-        }
+        // Move to the next node in the list
+        link = next_link;
     }
 }
-
 
 BOOL
 GetPrivilege  (
@@ -734,7 +820,7 @@ full_virtual_memory_test (
     ) {
     unsigned i;
     PULONG_PTR arbitrary_va;
-    unsigned random_number;
+    ULONG64 random_number;
     BOOL allocated;
     BOOL page_faulted;
     BOOL privilege;
@@ -745,9 +831,19 @@ full_virtual_memory_test (
     ULONG_PTR virtual_address_size;
     ULONG_PTR virtual_address_size_in_unsigned_chunks;
 
+    InitializeListHead(&pfn_free_list);
     InitializeListHead(&pfn_active_list);
     InitializeListHead(&pfn_modified_list);
     InitializeListHead(&pfn_standby_list);
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start_time;
+    LARGE_INTEGER end_time;
+    double elapsed_ms;
+
+    // Query the system timer frequency up front
+    QueryPerformanceFrequency(&frequency);
+
 
     //
     // Allocate the physical pages that we will be managing.
@@ -886,12 +982,17 @@ full_virtual_memory_test (
         return;
     }
 
+    printf("Starting virtual memory simulation workload...\n");
+
+    // START TIMER HERE
+    QueryPerformanceCounter(&start_time);
+
     //
     // Now perform random accesses.
     //
 
-    for (i = 0; i < (MB(1) / 4); i += 1) {
-        random_number = rand () * rand () * rand ();
+    for (i = 0; i < (MB(1) / 1); i += 1) {
+        random_number = (ULONG64) rand () * (ULONG64) rand () * (ULONG64) rand ();
         random_number %= virtual_address_size_in_unsigned_chunks;
 
         random_number &= ~0x7;
@@ -923,7 +1024,10 @@ full_virtual_memory_test (
                 pfn_metadata* target_pfn = NULL;
 
                 // 1. Check for free pages we can use
-                target_pfn = get_free_page();
+                if (!IsListEmpty(&pfn_free_list)) {
+                    PLIST_ENTRY free_entry = RemoveHeadList(&pfn_free_list);
+                    target_pfn = GetPfnFromListEntry(free_entry);
+                }
 
                 // 2. If no free pages, try to rescue/steal a frame sitting on the Standby List
                 if (target_pfn == NULL && !IsListEmpty(&pfn_standby_list)) {
@@ -950,7 +1054,7 @@ full_virtual_memory_test (
                     int batch_count = 0;
 
                     // Get our candidates
-                    get_unmap_candidates(&batch_count, batch_size, physical_page_count,
+                    get_unmap_candidates_and_save_to_disc(&batch_count, batch_size, physical_page_count,
                         unmap_batch, disc_page_count, disc);
 
                     // Unmap our candidates to free their pages
@@ -979,47 +1083,47 @@ full_virtual_memory_test (
                         target_pfn = GetPfnFromListEntry(standby_entry);
 
                         if (target_pfn->pte != NULL) {
-                            target_pfn->pte->disc.transition = 0;
-                            target_pfn->pte->disc.disc = 1;
+                            set_to_disc_state(target_pfn->pte, target_pfn);
                         }
                     }
                 }
 
-                if (target_pfn == NULL) {
-                    printf("CRITICAL: No physical frame could be recovered!\n");
+                if (target_pfn != NULL) {
+                    PVOID va_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~(PAGE_SIZE - 1));
+
+                    // First, establish the physical mapping to our target page window
+                    if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+                        printf("Failed to map target window. Error: %lu\n", GetLastError());
+                        return;
+                    }
+
+                    // Check the CURRENT FAULTING address state, not the target node state!
+                    if (is_on_disk && old_disc_slot != -1) {
+                        void* disc_address = (char*)disc + (old_disc_slot * PAGE_SIZE);
+
+                        // Bring the old data back from the fake disk into RAM
+                        memcpy(va_aligned, disc_address, PAGE_SIZE);
+
+                        // SUCCESS: Reclaim the swap slot so it can be re-allocated later!
+                        disc_metadata[old_disc_slot] = FALSE;
+                    }
+                    else {
+                        // Brand new page encounter: zero it out to clear uninitialized junk
+                        memset(va_aligned, 0, PAGE_SIZE);
+                    }
+                    // Update structural metadata and track the frame inside the active list
+                    target_pfn->isOccupied = 1;
+                    target_pfn->pte = pte;
+                    InsertTailList(&pfn_active_list, &target_pfn->list);
+
+                    // Make the software PTE valid so execution can repeat without faulting
+                    set_pte_valid(pte, target_pfn->frame_number);
+                    pte->hardware.age = 0; // Reset working set age profile
+
+                } else {
+                    printf("CRITICAL: Out of physical memory and swap space!\n");
                     DebugBreak();
-                    return;
                 }
-
-                // Now we need to actually map our new page
-                ULONG64 hardware_frame = target_pfn->frame_number;
-                PULONG_PTR aligned_new_va = get_va_from_pte(pte);
-
-                // Map the physical frame into our hardware address window
-                if (MapUserPhysicalPages((PVOID)aligned_new_va, 1, &hardware_frame) == FALSE) {
-                    printf("Failed to map target window. Error: %lu\n", GetLastError());
-                    return;
-                }
-
-                // 4. If we had data on disc, we can put it on our new page
-                if (is_on_disk) {
-                    void* disc_address = (char*)disc + (old_disc_slot * PAGE_SIZE);
-                    memcpy((void*)aligned_new_va, disc_address, PAGE_SIZE);
-                    disc_metadata[old_disc_slot] = FALSE; // Reclaim disk slot
-                }
-                // If we didn't have data then this is the first time we have accessed this page
-                // We must clear it out to prevent security issues
-                else {
-                    memset((void*)aligned_new_va, 0, PAGE_SIZE);
-                }
-
-                // The page is now active so have both the pte and the pfn reflect this
-                set_pte_valid(pte, hardware_frame);
-                pte->hardware.age = 1; // Reset age on access
-
-                target_pfn->pte = pte;
-                target_pfn->isOccupied = 1; // Frame is officially Active (1)
-                InsertTailList(&pfn_active_list, &target_pfn->list);
             }
         }
         // If we do not fault
@@ -1040,6 +1144,18 @@ full_virtual_memory_test (
             }
         }
     }
+
+    // STOP TIMER HERE
+    QueryPerformanceCounter(&end_time);
+
+    // Calculate elapsed time in milliseconds
+    elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
+
+    printf("\n==============================================\n");
+    printf("WORKLOAD COMPLETE\n");
+    printf("Total execution time: %.2f ms\n", elapsed_ms);
+    printf("Total access iterations: %u\n", i);
+    printf("==============================================\n\n");
 
     printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", i);
 
