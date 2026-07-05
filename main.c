@@ -219,6 +219,8 @@ commit_at_fault_time_test (
 #define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 #define DISC_BATCH 16
 #define MAX_TRIM_PAGES 64
+
+#define PTE_REGION_SIZE 512
 // How few pages we tolerate before waking the background Trim Thread
 #define LOWEST_PAGES 200
 
@@ -376,7 +378,9 @@ int current_free_pages = 0;
 int current_standby_pages = 0;
 
 CRITICAL_SECTION cs;
-CRITICAL_SECTION pte_lock;
+CRITICAL_SECTION* pte_region_locks;
+ULONG64 num_pte_regions;
+
 CRITICAL_SECTION pfn_lock;
 CRITICAL_SECTION disc_lock;
 
@@ -696,6 +700,31 @@ CreateSharedMemorySection (
 }
 #endif
 
+
+CRITICAL_SECTION* get_pte_lock_for_va(PVOID arbitrary_va) {
+    // 1. How far into the VA space is this address?
+    ULONG_PTR offset = (ULONG_PTR)arbitrary_va - (ULONG_PTR)va_start;
+
+    // 2. Which PTE index does this correspond to?
+    ULONG64 pte_index = offset / PAGE_SIZE;
+
+    // 3. Which region block does this PTE fall into?
+    ULONG64 region_index = pte_index / PTE_REGION_SIZE;
+
+    return &pte_region_locks[region_index];
+}
+
+CRITICAL_SECTION* get_pte_lock_from_pte_pointer(PPTE target_pte) {
+    // 1. Calculate the index by subtracting the array base pointer from our specific pointer.
+    // (C automatically divides the memory difference by sizeof(PTE)).
+    ULONG64 pte_index = (ULONG64)(target_pte - page_table);
+
+    // 2. Divide by the region size to find the right lock
+    ULONG64 region_index = pte_index / PTE_REGION_SIZE;
+
+    return &pte_region_locks[region_index];
+}
+
 VOID write_to_disc(pfn_metadata** candidates, ULONG64 batch_count) {
     ULONG_PTR frame_array[DISC_BATCH];
     ULONG64 disc_slots[DISC_BATCH];
@@ -745,8 +774,10 @@ VOID write_to_disc(pfn_metadata** candidates, ULONG64 batch_count) {
 VOID
 get_unmap_candidates(int* batch_count, int batch_size, PULONG_PTR* unmap_batch) {
 
+    EnterCriticalSection(&cs);
     // Get head of active list
     PLIST_ENTRY link = pfn_active_list.Flink;
+
 
 #if 0
     // Loop until we are back at head or we have fulfilled our batch size
@@ -758,9 +789,13 @@ get_unmap_candidates(int* batch_count, int batch_size, PULONG_PTR* unmap_batch) 
         // If we are active
         if (candidate->isOccupied == 1 && candidate->pte != NULL) {
             // If our age > 0
+            CRITICAL_SECTION* target_pte_lock = get_pte_lock_from_pte_pointer(evict_pte);
+
+            // 2. Drop the global lock so we don't deadlock or hold it too long
+            LeaveCriticalSection(&cs);
             if (candidate->pte->hardware.age > 0) {
                 // Get the pte, va and add to the unmapping array
-                PPTE evict_pte = candidate->pte;
+
                 PULONG_PTR evict_va = get_va_from_pte(evict_pte);
 
                 unmap_batch[*batch_count] = evict_va;
@@ -794,10 +829,33 @@ get_unmap_candidates(int* batch_count, int batch_size, PULONG_PTR* unmap_batch) 
             if (candidate->isOccupied == 1 && candidate->pte != NULL) {
                 // Get pte, va and add to unmap array
                 PPTE evict_pte = candidate->pte;
+                CRITICAL_SECTION* target_pte_lock = get_pte_lock_from_pte_pointer(evict_pte);
+
+                // 2. Drop the global lock so we don't deadlock or hold it too long
+                LeaveCriticalSection(&cs);
+
+                if (TryEnterCriticalSection(target_pte_lock)) {
+                    // 1. Save the frame number BEFORE we destroy the PTE
+                    ULONG64 saved_frame = candidate->frame_number;
+
+                    // 2. WIPE the entire 64-bit PTE clean. This kills all old hardware flags.
+                    *(PULONG64)evict_pte = 0;
+
+                    // 3. Rebuild it specifically as a transition PTE
+                    evict_pte->transition.valid = 0;
+                    evict_pte->transition.transition = 1;
+                    evict_pte->transition.frame_number = saved_frame; // Explicitly assign it through the transition struct
+                }
+
                 PULONG_PTR evict_va = get_va_from_pte(evict_pte);
 
                 unmap_batch[*batch_count] = evict_va;
                 (*batch_count)++;
+
+                LeaveCriticalSection(target_pte_lock);
+
+                // Re-enter the global lock to safely modify the lists
+                EnterCriticalSection(&cs);
 
                 // Remove from active list and mark modified
                 RemoveEntryList(&candidate->list);
@@ -806,22 +864,15 @@ get_unmap_candidates(int* batch_count, int batch_size, PULONG_PTR* unmap_batch) 
                 // Add to modified list
                 InsertTailList(&pfn_modified_list, &candidate->list);
 
-                PPTE pte = candidate->pte;
-
-                // 1. Save the frame number BEFORE we destroy the PTE
-                ULONG64 saved_frame = candidate->frame_number;
-
-                // 2. WIPE the entire 64-bit PTE clean. This kills all old hardware flags.
-                *(PULONG64)pte = 0;
-
-                // 3. Rebuild it specifically as a transition PTE
-                pte->transition.valid = 0;
-                pte->transition.transition = 1;
-                pte->transition.frame_number = saved_frame; // Explicitly assign it through the transition struct
+            }
+            else {
+                // Lock collision! Just re-enter global lock and move to the next candidate
+                EnterCriticalSection(&cs);
             }
             link = next_link;
         }
     }
+    LeaveCriticalSection(&cs);
 }
 
 
@@ -951,6 +1002,19 @@ BOOL set_up_program() {
     ULONG64 actual_num_ptes = virtual_address_size / PAGE_SIZE;
     page_table = zero_malloc(actual_num_ptes * sizeof(PTE));
 
+    // --- NEW: Set up PTE Region Locks ---
+    num_pte_regions = (actual_num_ptes + (PTE_REGION_SIZE - 1)) / PTE_REGION_SIZE;
+    pte_region_locks = malloc(num_pte_regions * sizeof(CRITICAL_SECTION));
+
+    if (pte_region_locks == NULL) {
+        printf("CRITICAL: Failed to allocate region locks\n");
+        return FALSE;
+    }
+
+    for (ULONG64 i = 0; i < num_pte_regions; i++) {
+        InitializeCriticalSectionAndSpinCount(&pte_region_locks[i], 0x00FFFFFF);
+    }
+
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
     MEM_EXTENDED_PARAMETER parameter = { 0 };
     parameter.Type = MemExtendedParameterUserPhysicalHandle;
@@ -978,7 +1042,8 @@ BOOL set_up_program() {
     return TRUE;
 }
 
-VOID handle_hard_fault(PPTE pte, PVOID arbitrary_va) {
+
+VOID handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
     // If we are on disc then get disc index else set to -1
     BOOL is_on_disc = pte->disc.disc;
@@ -1033,16 +1098,18 @@ VOID handle_hard_fault(PPTE pte, PVOID arbitrary_va) {
 
             // 3. If both are empty, we must wait for the background threads
             if (target_pfn == NULL) {
+
                 SetEvent(LowPagesEvent); // Wake up trim thread
 
                 LeaveCriticalSection(&cs);
                 LeaveCriticalSection(&pfn_lock);
-                LeaveCriticalSection(&pte_lock);
+                CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(arbitrary_va);
+                LeaveCriticalSection(my_pte_lock);
 
                 // Wait for the Disc thread to put a page on the standby list
                 WaitForSingleObject(StandbyPageAvailableEvent, INFINITE);
 
-                EnterCriticalSection(&pte_lock);
+                EnterCriticalSection(my_pte_lock);
                 EnterCriticalSection(&pfn_lock);
                 EnterCriticalSection(&cs);
             }
@@ -1098,7 +1165,7 @@ VOID handle_hard_fault(PPTE pte, PVOID arbitrary_va) {
 
         LeaveCriticalSection(&cs);
         LeaveCriticalSection(&pfn_lock);
-        LeaveCriticalSection(&pte_lock);
+        LeaveCriticalSection(my_pte_lock);
 
     }
     // If we never got a page
@@ -1109,7 +1176,7 @@ VOID handle_hard_fault(PPTE pte, PVOID arbitrary_va) {
 }
 
 VOID
-handle_soft_fault(PPTE pte, PVOID arbitrary_va) {
+handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     // Rescue
     ULONG64 frame_number = pte->transition.frame_number;
 
@@ -1157,7 +1224,7 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va) {
         pte->hardware.age = 0;
 
         LeaveCriticalSection(&pfn_lock);
-        LeaveCriticalSection(&pte_lock);
+        LeaveCriticalSection(my_pte_lock);
 
         // Rescue complete!
         return;
@@ -1190,11 +1257,12 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va) {
 
                 LeaveCriticalSection(&cs);
                 LeaveCriticalSection(&pfn_lock);
-                LeaveCriticalSection(&pte_lock);
+                CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(arbitrary_va);
+                LeaveCriticalSection(my_pte_lock);
 
                 WaitForSingleObject(StandbyPageAvailableEvent, INFINITE);
 
-                EnterCriticalSection(&pte_lock);
+                EnterCriticalSection(my_pte_lock);
                 EnterCriticalSection(&pfn_lock);
                 EnterCriticalSection(&cs);
             }
@@ -1229,7 +1297,7 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va) {
 
         LeaveCriticalSection(&cs);
         LeaveCriticalSection(&pfn_lock);
-        LeaveCriticalSection(&pte_lock);
+        LeaveCriticalSection(my_pte_lock);
     }
 }
 
@@ -1238,7 +1306,8 @@ VOID handle_page_fault(PVOID arbitrary_va) {
     // Get pte from our va
     PPTE pte = get_pte_from_va(arbitrary_va);
 
-    EnterCriticalSection(&pte_lock);
+    CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(arbitrary_va);
+    EnterCriticalSection(my_pte_lock);
     EnterCriticalSection(&pfn_lock);
     EnterCriticalSection(&cs);
 
@@ -1246,28 +1315,28 @@ VOID handle_page_fault(PVOID arbitrary_va) {
     if (pte->hardware.valid == 1) {
         LeaveCriticalSection(&cs);
         LeaveCriticalSection(&pfn_lock);
-        LeaveCriticalSection(&pte_lock);
+        LeaveCriticalSection(my_pte_lock);
         return;
     }
 
     // 2. Check transition state next (Ignore disc completely here)
     if (pte->transition.transition == 1) {
-        handle_soft_fault(pte, arbitrary_va);
+        handle_soft_fault(pte, arbitrary_va, my_pte_lock);
     }
     // 3. If transition is 0, it is safe to read the disc bit payload
     else if (pte->disc.disc == 1) {
-        handle_hard_fault(pte, arbitrary_va);
+        handle_hard_fault(pte, arbitrary_va, my_pte_lock);
     }
     // 4. If valid=0, transition=0, and disc=0, it's a fresh allocation
     else if (pte->disc.disc == 0) {
         // Handle demand-zero fault if you have one, or handle as hard fault
-        handle_hard_fault(pte, arbitrary_va);
+        handle_hard_fault(pte, arbitrary_va, my_pte_lock);
     }
     else {
         printf("CRITICAL: Unrecognized PTE state!\n");
         LeaveCriticalSection(&cs);
         LeaveCriticalSection(&pfn_lock);
-        LeaveCriticalSection(&pte_lock);
+        LeaveCriticalSection(my_pte_lock);
         DebugBreak();
     }
 }
@@ -1306,7 +1375,7 @@ full_virtual_memory_test_helper(int thread_number) {
     BOOL resolved = TRUE;
 
     // Now perform random access
-    while (i < (MB(1) / 1)) {
+    while (i < (2 * (MB(1) / 1))) {
 
         if (resolved) {
             // Get random number
@@ -1323,6 +1392,14 @@ full_virtual_memory_test_helper(int thread_number) {
 
 
         __try {
+            ULONG_PTR current_value = *(volatile PULONG_PTR)arbitrary_va;
+
+            // If the page isn't blank (0), it MUST match our VA
+            if (current_value != 0 && current_value != (ULONG_PTR)arbitrary_va) {
+                printf("CRITICAL: Data corruption! VA %p was overwritten with %p\n",
+                       arbitrary_va, (PVOID)current_value);
+                DebugBreak();
+            }
             *(PULONG_PTR)arbitrary_va = (ULONG_PTR) arbitrary_va;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1353,6 +1430,7 @@ full_virtual_memory_test_helper(int thread_number) {
             }
             LeaveCriticalSection(&cs);
         }
+
 
         resolved = TRUE;
         i++;
@@ -1387,18 +1465,11 @@ DWORD WINAPI TrimThreadWorker(LPVOID lpParam) {
 
         if (waitResult == WAIT_OBJECT_0) {
             // LowMemoryEvent triggered! Lock the memory structures.
-            EnterCriticalSection(&pte_lock);
-            EnterCriticalSection(&pfn_lock);
-            EnterCriticalSection(&cs);
 
             // Call your trim logic to harvest pages.
             // Note: Since this is a background thread, it doesn't need to return a
             // rescued page to handle_page_fault. It just needs to populate the lists.
             trim();
-
-            LeaveCriticalSection(&cs);
-            LeaveCriticalSection(&pfn_lock);
-            LeaveCriticalSection(&pte_lock);
 
             // Tell the disc thread that new pages are sitting in the modified list waiting to be written
             SetEvent(PagesReadyForDiscEvent);
@@ -1419,13 +1490,10 @@ DWORD WINAPI DiscThreadWorker(LPVOID lpParam) {
             while (TRUE) {
                 if (WaitForSingleObject(ShutdownEvent, 0) == WAIT_OBJECT_0) return 0;
 
+                EnterCriticalSection(&cs);
+
                 pfn_metadata* batch[DISC_BATCH];
                 int batch_count = 0;
-
-                // ACQUIRE ALL 3 IN STRICT ORDER
-                EnterCriticalSection(&pte_lock);
-                EnterCriticalSection(&pfn_lock);
-                EnterCriticalSection(&cs);
 
                 // Harvest up to DISC_BATCH candidates from the modified list
                 while (!IsListEmpty(&pfn_modified_list) && batch_count < DISC_BATCH) {
@@ -1437,30 +1505,26 @@ DWORD WINAPI DiscThreadWorker(LPVOID lpParam) {
                     batch_count++;
                 }
 
+                LeaveCriticalSection(&cs);
+
                 // If we didn't find anything, we're done batching.
                 if (batch_count == 0) {
-                    LeaveCriticalSection(&cs);
-                    LeaveCriticalSection(&pfn_lock);
-                    LeaveCriticalSection(&pte_lock);
                     break;
                 }
-
-                // DROP ALL 3 BEFORE SLOW I/O
-                LeaveCriticalSection(&cs);
-                LeaveCriticalSection(&pfn_lock);
-                LeaveCriticalSection(&pte_lock);
 
                 // FIRE THE BATCH I/O
                 write_to_disc(batch, batch_count);
 
-                // RE-ACQUIRE ALL 3 IN STRICT ORDER
-                EnterCriticalSection(&pte_lock);
-                EnterCriticalSection(&pfn_lock);
-                EnterCriticalSection(&cs);
-
                 // Process the aftermath of the batch
                 for (int i = 0; i < batch_count; i++) {
                     pfn_metadata* candidate = batch[i];
+                    PPTE evict_pte = candidate->pte;
+
+                    CRITICAL_SECTION* region_lock = get_pte_lock_from_pte_pointer(evict_pte);
+
+                    // 2. Lock in strict hierarchy: PTE Region -> Global CS
+                    EnterCriticalSection(region_lock);
+                    EnterCriticalSection(&cs);
 
                     // If bit 0, it was poached by a soft fault while we were doing I/O
                     if (candidate->isBeingWrittenToDisc == 0) {
@@ -1471,19 +1535,25 @@ DWORD WINAPI DiscThreadWorker(LPVOID lpParam) {
                     }
                     // Otherwise, the write was completely successful
                     else {
+                        // Update the PTE to point to the new disc location!
+                        *(PULONG64)evict_pte = 0;
+                        evict_pte->disc.valid = 0;
+                        evict_pte->disc.disc = 1;
+                        evict_pte->disc.disc_index = candidate->disc_index;
+
+                        // Finalize the PFN metadata
                         candidate->isBeingWrittenToDisc = 0;
                         candidate->isOccupied = 3;
 
+                        // Safely move to the standby list
                         InsertTailList(&pfn_standby_list, &candidate->list);
                         current_standby_pages++;
                         SetEvent(StandbyPageAvailableEvent);
                     }
-                }
 
-                // DROP ALL 3
-                LeaveCriticalSection(&cs);
-                LeaveCriticalSection(&pfn_lock);
-                LeaveCriticalSection(&pte_lock);
+                    LeaveCriticalSection(&cs);
+                    LeaveCriticalSection(region_lock);
+                }
             }
         }
     }
@@ -1506,7 +1576,9 @@ full_virtual_memory_test (
     QueryPerformanceCounter(&start_time);
 
     InitializeCriticalSectionAndSpinCount(&cs, 0x00FFFFFF);
-    InitializeCriticalSectionAndSpinCount(&pte_lock, 0x00FFFFFF);
+    for (ULONG64 i = 0; i < num_pte_regions; i++) {
+        InitializeCriticalSectionAndSpinCount(&pte_region_locks[i], 0x00FFFFFF);
+    }
     InitializeCriticalSectionAndSpinCount(&pfn_lock, 0x00FFFFFF);
     InitializeCriticalSectionAndSpinCount(&disc_lock, 0x00FFFFFF);
 
@@ -1562,7 +1634,9 @@ full_virtual_memory_test (
 
 
     DeleteCriticalSection(&cs);
-    DeleteCriticalSection(&pte_lock);
+    for (ULONG64 i = 0; i < num_pte_regions; i++) {
+        DeleteCriticalSection(&pte_region_locks[i]);
+    }
     DeleteCriticalSection(&pfn_lock);
     DeleteCriticalSection(&disc_lock);
 
