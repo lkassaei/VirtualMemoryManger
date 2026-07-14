@@ -1,4 +1,3 @@
-
 #if 0
 VOID
 malloc_test (
@@ -213,7 +212,7 @@ commit_at_fault_time_test (
 
 #define MAX_AGE_BITS 8
 
-#define NUMBER_OF_PHYSICAL_PAGES (MB(1024) / PAGE_SIZE)
+#define NUMBER_OF_PHYSICAL_PAGES (1 * (MB(1024) / PAGE_SIZE))
 //#define NUMBER_OF_PHYSICAL_PAGES 4
 #define NUM_PTEs (VIRTUAL_ADDRESS_SIZE / PAGE_SIZE)
 #define NUM_DISC_PAGES (5 * NUMBER_OF_PHYSICAL_PAGES)
@@ -235,6 +234,16 @@ commit_at_fault_time_test (
 #define STAGING_SLOTS (2 * (NUM_WORKER_THREADS + 1))   // 14 for 7 faulting threads
 
 #define NUM_WORKER_THREADS 6
+
+#define MIN_RUN_PAGES   16      // shortest linear run
+#define MAX_RUN_PAGES   512     // longest linear run
+#define REVISIT_CHANCE  4       // 1-in-N chance we jump BACK to a recent hot spot
+#define HOT_SPOTS       8       // how many recent bases we remember
+
+
+#define FRAME_IS_VALID(f) \
+(((f) <= max_frame_number) && \
+((frame_valid_bitmap[(f) >> 6] >> ((f) & 63)) & 1ULL))
 
 #define DEBUG 1
 #if DEBUG
@@ -359,7 +368,13 @@ typedef struct {
     ULONG64 disc_index: MAX_DISC_PTE_BITS;
     ULONG64 isOccupied: 2; // 00 = free, 01 = active, 10 = modified, 11 = standby
     ULONG64 isBeingWrittenToDisc: 1; // 0 = no 1 = yes
+    ULONG64 lock_bit: 1;              // reserved: future home of the 1-bit lock
+    ULONG64 reserved: 20;
+    CRITICAL_SECTION lock;            // delete once lock_bit works
 } pfn_metadata;
+
+static __forceinline VOID lock_pfn(pfn_metadata* p)   { EnterCriticalSection(&p->lock); }
+static __forceinline VOID unlock_pfn(pfn_metadata* p) { LeaveCriticalSection(&p->lock); }
 
 typedef struct _LOCKED_LIST {
     LIST_ENTRY head;          // flink/blink
@@ -400,6 +415,8 @@ PVOID temp_disc_va_start = NULL;
 PVOID staging_va_start;
 volatile LONG staging_in_use[STAGING_SLOTS];
 
+ULONG64* frame_valid_bitmap = NULL;
+
 
 CRITICAL_SECTION cs;
 ULONG64 num_pte_regions;
@@ -416,7 +433,6 @@ HANDLE StandbyPageAvailableEvent;
 HANDLE ShutdownEvent;
 HANDLE StartAgingEvent;      // auto-reset: trim asks for a pass
 HANDLE FinishedAgingEvent;   // auto-reset: aging reports a completed sweep
-
 
 // Get the metadata from a node on a list
 pfn_metadata*
@@ -463,6 +479,21 @@ VOID LockedRemoveEntry(PLOCKED_LIST list, PLIST_ENTRY entry) {
     LeaveCriticalSection(&list->lock);
 }
 
+// Returns TRUE if we unlinked it; FALSE if it was already off the list.
+BOOL LockedTryRemoveEntry(PLOCKED_LIST list, PLIST_ENTRY entry) {
+    BOOL removed = FALSE;
+    EnterCriticalSection(&list->lock);
+    if (entry->Flink != NULL) {
+        RemoveEntryList(entry);
+        list->count--;
+        entry->Flink = NULL;
+        entry->Blink = NULL;
+        removed = TRUE;
+    }
+    LeaveCriticalSection(&list->lock);
+    return removed;
+}
+
 VOID LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry) {
     EnterCriticalSection(&list->lock);
     InsertTailList(&list->head, entry);
@@ -491,15 +522,6 @@ ensure_metadata_slot_is_committed(pfn_metadata* table_base, ULONG64 frame_number
     }
 }
 
-// New 0(1) way to get the metadata from a frame number
-pfn_metadata*
-find_pfn_from_frame_number(ULONG64 frame_number) {
-    if (frame_number <= max_frame_number) {
-        return &frame_to_pfn_table[frame_number];
-    }
-    return NULL;
-}
-
 // Malloc and zero out new data
 PVOID
 zero_malloc(size_t num_bytes) {
@@ -511,46 +533,73 @@ zero_malloc(size_t num_bytes) {
     return p;
 }
 
+pfn_metadata*
+find_pfn_from_frame_number(ULONG64 frame_number) {
+    if (!FRAME_IS_VALID(frame_number)) return NULL;
+    return &frame_to_pfn_table[frame_number];
+}
+
 // Create our new pfn metadata sparse array
 VOID
 setup_pfn_metadata(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbers) {
-    // Find the max frame number we were given
-    for (int j = 0; j < physical_page_count; j++) {
+    for (ULONG_PTR j = 0; j < physical_page_count; j++) {
         if (physical_page_numbers[j] > max_frame_number) {
             max_frame_number = physical_page_numbers[j];
         }
     }
 
-    // Size the array based on our largest frame number
     ULONG_PTR table_reserve_size = (max_frame_number + 1) * sizeof(pfn_metadata);
 
-    // LK was lazy and mem commited everything, go back and only commit the places with the frame numbers
     frame_to_pfn_table = (pfn_metadata*)VirtualAlloc(
         NULL,
         table_reserve_size,
-        MEM_RESERVE | MEM_COMMIT,
+        MEM_RESERVE,
         PAGE_READWRITE
     );
 
     if (frame_to_pfn_table == NULL) {
-        printf("CRITICAL: Failed to reserve and commit tracking table. Error: %lu\n", GetLastError());
+        printf("CRITICAL: Failed to reserve tracking table. Error: %lu\n", GetLastError());
         DebugBreak();
         return;
     }
 
-    // Set up the pfn metadata and add everything to the free list initially
-    for (int j = 0; j < physical_page_count; j++) {
+    // Validity bitmap — one bit per possible frame. ~600KB at max_frame=4.9M.
+    ULONG_PTR bitmap_bytes = ((max_frame_number / 64) + 1) * sizeof(ULONG64);
+    frame_valid_bitmap = zero_malloc(bitmap_bytes);
+
+    for (ULONG_PTR j = 0; j < physical_page_count; j++) {
         ULONG64 frame = physical_page_numbers[j];
 
-        frame_to_pfn_table[frame].frame_number = frame;
-        frame_to_pfn_table[frame].isOccupied = 0;
+        ensure_metadata_slot_is_committed(frame_to_pfn_table, frame);
 
-        frame_to_pfn_table[frame].disc_index = INVALID_DISC_SLOT;
-        frame_to_pfn_table[frame].isBeingWrittenToDisc = 0;
+        pfn_metadata* p = &frame_to_pfn_table[frame];
 
-        InitializeListHead(&frame_to_pfn_table[frame].list);
-        LockedInsertTail(&pfn_free_list, &frame_to_pfn_table[frame].list);
+        p->frame_number         = frame;
+        p->pte                  = NULL;
+        p->isOccupied           = 0;
+        p->disc_index           = INVALID_DISC_SLOT;
+        p->isBeingWrittenToDisc = 0;
+
+        InitializeCriticalSectionAndSpinCount(&p->lock, 4000);
+
+        frame_valid_bitmap[frame >> 6] |= (1ULL << (frame & 63));
+
+        InitializeListHead(&p->list);
+        LockedInsertTail(&pfn_free_list, &p->list);
     }
+
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR committed = 0;
+    PCHAR addr = (PCHAR)frame_to_pfn_table;
+    PCHAR end  = addr + table_reserve_size;
+    while (addr < end && VirtualQuery(addr, &mbi, sizeof(mbi))) {
+        if (mbi.State == MEM_COMMIT) committed += mbi.RegionSize;
+        addr += mbi.RegionSize;
+    }
+    printf("PFN table: committed %llu MB of %llu MB reserved (%llu frames)\n",
+           (ULONG64)committed / MB(1),
+           (ULONG64)table_reserve_size / MB(1),
+           (ULONG64)physical_page_count);
 }
 
 typedef struct _THREAD_RNG_STATE {
@@ -903,7 +952,9 @@ static VOID harvest_one_bin(PPTE_REGION region, PLIST_ENTRY head,
         evict_pte->transition.transition = 1;
         evict_pte->transition.frame_number = saved_frames[i];
 
+        lock_pfn(candidate);
         candidate->isOccupied = 2;        // set BEFORE the insert
+        unlock_pfn(candidate);
         LockedInsertTail(&pfn_modified_list, &candidate->list);
     }
 
@@ -1103,60 +1154,79 @@ BOOL set_up_program() {
 }
 
 pfn_metadata* pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
-    pfn_metadata* result = NULL;
+    ULONG64 attempts = 0;
+    for (;;) {
+        if (++attempts > 16) return NULL;   // give up; caller waits/retries
 
-    EnterCriticalSection(&pfn_standby_list.lock);
+        pfn_metadata* cand = NULL;
+        PPTE owner_pte = NULL;
+        int skip = attempts - 1;            // skip the ones we already failed on
 
-    PLIST_ENTRY standby_entry = pfn_standby_list.head.Flink;
-
-    while (standby_entry != &pfn_standby_list.head) {
-        pfn_metadata* target_pfn = GetPfnFromListEntry(standby_entry);
-        PPTE old_owner_pte = target_pfn->pte;
-
-        if (old_owner_pte != NULL) {
-            CRITICAL_SECTION* old_region_lock = get_pte_lock_from_pte_pointer(old_owner_pte);
-
-            if (old_region_lock == my_pte_lock) {
-                RemoveEntryList(&target_pfn->list);
-                target_pfn->list.Flink = NULL;
-                target_pfn->list.Blink = NULL;
-                pfn_standby_list.count--;
-
-                set_to_disc_state(old_owner_pte, target_pfn);
-                target_pfn->disc_index = INVALID_DISC_SLOT;
-                target_pfn->isOccupied = 1;          // <-- ADD: off standby, now active. Atomic with unlink.
-                result = target_pfn;
-                break;
+        EnterCriticalSection(&pfn_standby_list.lock);
+        PLIST_ENTRY e = pfn_standby_list.head.Flink;
+        while (e != &pfn_standby_list.head) {
+            pfn_metadata* p = GetPfnFromListEntry(e);
+            if (p->isOccupied == 3 && p->isBeingWrittenToDisc == 0) {
+                if (skip > 0) { skip--; }   // walk past previously-contended ones
+                else { cand = p; owner_pte = p->pte; break; }
             }
-            else if (TryEnterCriticalSection(old_region_lock)) {
-                RemoveEntryList(&target_pfn->list);
-                target_pfn->list.Flink = NULL;
-                target_pfn->list.Blink = NULL;
-                pfn_standby_list.count--;
-
-                set_to_disc_state(old_owner_pte, target_pfn);
-                target_pfn->disc_index = INVALID_DISC_SLOT;
-                target_pfn->isOccupied = 1;          // <-- ADD
-                LeaveCriticalSection(old_region_lock);
-                result = target_pfn;
-                break;
-            }
-        } else {
-            RemoveEntryList(&target_pfn->list);
-            target_pfn->list.Flink = NULL;
-            target_pfn->list.Blink = NULL;
-            pfn_standby_list.count--;
-
-            target_pfn->disc_index = INVALID_DISC_SLOT;
-            target_pfn->isOccupied = 1;              // <-- ADD
-            result = target_pfn;
-            break;
+            e = e->Flink;
         }
-        standby_entry = standby_entry->Flink;
-    }
+        LeaveCriticalSection(&pfn_standby_list.lock);
 
-    LeaveCriticalSection(&pfn_standby_list.lock);
-    return result;
+        if (cand == NULL) return NULL;
+
+        // No owner PTE — nothing to stamp, just claim it.
+        if (owner_pte == NULL) {
+            EnterCriticalSection(&pfn_standby_list.lock);
+            if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+                cand->pte != NULL) {
+                LeaveCriticalSection(&pfn_standby_list.lock);
+                continue;                      // changed under us; retry
+            }
+            RemoveEntryList(&cand->list);
+            cand->list.Flink = cand->list.Blink = NULL;
+            pfn_standby_list.count--;
+            LeaveCriticalSection(&pfn_standby_list.lock);
+
+            cand->disc_index = INVALID_DISC_SLOT;
+            cand->isOccupied = 1;
+            return cand;
+        }
+
+        CRITICAL_SECTION* owner_lock = get_pte_lock_from_pte_pointer(owner_pte);
+
+        // Acquire the owner's region lock FIRST (no other locks held).
+        // If it's our own lock, we already hold it — don't re-enter blindly;
+        // CRITICAL_SECTION is recursive, but the re-verify below is what matters.
+        if (owner_lock != my_pte_lock) {
+            if (!TryEnterCriticalSection(owner_lock)) continue;
+        }
+
+        lock_pfn(cand);                        // region -> page
+
+        if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+            cand->pte != owner_pte) {
+            unlock_pfn(cand);
+            if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+            continue;
+            }
+
+        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {   // page -> list
+            unlock_pfn(cand);
+            if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+            continue;
+        }
+
+        set_to_disc_state(owner_pte, cand);    // reads disc_index — BEFORE clearing it
+        cand->disc_index = INVALID_DISC_SLOT;
+        cand->isOccupied = 1;
+        unlock_pfn(cand);
+
+        cand->pte = NULL;                      // region-lock protected; we hold owner_lock
+        if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+        return cand;
+    }
 }
 
 VOID
@@ -1184,7 +1254,7 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
             LeaveCriticalSection(my_pte_lock);
             //WaitForSingleObject(StandbyPageAvailableEvent, INFINITE);
             while (pfn_free_list.count == 0 && pfn_standby_list.count == 0) {
-                WaitForSingleObject(StandbyPageAvailableEvent, 100);  // TIMEOUT, not INFINITE
+                WaitForSingleObject(StandbyPageAvailableEvent, 10);
             }
             EnterCriticalSection(my_pte_lock);
 
@@ -1212,7 +1282,9 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     }
 
     // The frame we got is now exclusively ours; it should carry no disc slot.
+    lock_pfn(target_pfn);
     target_pfn->disc_index = INVALID_DISC_SLOT;
+    unlock_pfn(target_pfn);
 
     int slot = claim_staging_slot();
     PVOID staging_va = (char*)staging_va_start + (slot * PAGE_SIZE);
@@ -1226,9 +1298,12 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
         printf("Failed to map target window. VA %p Error: %lu\n", va_aligned, GetLastError());
         // P is half-pulled (occ=1, off all lists, not valid). Return it to the free
         // list cleanly rather than leaking it in a corrupt state.
+        lock_pfn(target_pfn);
         target_pfn->isOccupied = 0;      // free
-        target_pfn->pte = NULL;
         target_pfn->disc_index = INVALID_DISC_SLOT;
+        unlock_pfn(target_pfn);
+        target_pfn->pte = NULL;
+
         LockedInsertTail(&pfn_free_list, &target_pfn->list);
         LeaveCriticalSection(my_pte_lock);
         return;
@@ -1252,9 +1327,12 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     // 4. NOW publish: map at the real VA. The first moment any other thread can
     //    see this frame at this VA, it already holds the correct data.
     if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+        lock_pfn(target_pfn);
         target_pfn->isOccupied = 0;      // free
-        target_pfn->pte = NULL;
         target_pfn->disc_index = INVALID_DISC_SLOT;
+        unlock_pfn(target_pfn);
+        target_pfn->pte = NULL;
+
         LockedInsertTail(&pfn_free_list, &target_pfn->list);
         LeaveCriticalSection(my_pte_lock);
         return;
@@ -1269,10 +1347,11 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
     // THEN activate and publish to the age list. Now any harvester that
     // walks this list sees occ=1 AND valid=1 — invariant holds.
+    lock_pfn(target_pfn);
     target_pfn->isOccupied = 1;
-    EnterCriticalSection(&pfn_lock);
+    unlock_pfn(target_pfn);
+
     target_pfn->pte = pte;
-    LeaveCriticalSection(&pfn_lock);
 
     ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
     if (target_pfn->list.Flink != NULL || target_pfn->list.Blink != NULL) {
@@ -1287,76 +1366,49 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
 VOID
 handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
-    // Dispatch guarantees pte->transition.transition == 1. Safe to read the
-    // transition frame number (NOT disc fields — union aliasing).
     ULONG64 frame_number = pte->transition.frame_number;
     pfn_metadata* target_pfn = find_pfn_from_frame_number(frame_number);
 
     if (target_pfn == NULL) {
-        // Should be unreachable for a well-formed transition PTE.
         printf("SOFT FAULT: no PFN for frame 0x%llx pte=%p\n", frame_number, pte);
         DebugBreak();
         LeaveCriticalSection(my_pte_lock);
         return;
     }
 
-    // Decide poach-vs-on-a-list AND do the list removal atomically under
-    // pfn_lock. This is the fix: Phase 1 sets isBeingWrittenToDisc under
-    // pfn_lock while holding it across its own list removal, so if the flag
-    // is 0 here, the page is genuinely still on its list and cannot be pulled
-    // out from under us before we remove it.
-    BOOL poached_local = FALSE;
-    EnterCriticalSection(&pfn_lock);
+    lock_pfn(target_pfn);                              // region -> page
 
-    // Ownership re-verify: the frame must still belong to THIS pte. If another
-    // thread reassigned it while we raced, it isn't ours to rescue.
     if (target_pfn->pte != pte) {
-        LeaveCriticalSection(&pfn_lock);
+        unlock_pfn(target_pfn);
         LeaveCriticalSection(my_pte_lock);
-        return;   // re-fault will re-dispatch on current PTE state
+        return;
     }
 
-    BOOL poached = (target_pfn->isBeingWrittenToDisc == 1);
-    if (poached) {
-        target_pfn->isBeingWrittenToDisc = 0;
-        poached_local = TRUE;
+    ULONG64 slot_to_free = INVALID_DISC_SLOT;
 
-        // The disc slot Phase 1 reserved is now ours to release, since we're
-        // keeping the in-memory copy. Free it here, once, under disc_lock.
-        if (target_pfn->disc_index != INVALID_DISC_SLOT) {
-            EnterCriticalSection(&disc_lock);
-            disc_metadata[target_pfn->disc_index].isOccupied = FALSE;
-            LeaveCriticalSection(&disc_lock);
-            // LK maybe better tp use single linked list
-            LockedInsertTail(&disc_free_list, &disc_metadata[target_pfn->disc_index].list);
+    if (target_pfn->isBeingWrittenToDisc == 1) {
+        target_pfn->isBeingWrittenToDisc = 0;          // poach
+        slot_to_free  = target_pfn->disc_index;
+        target_pfn->disc_index = INVALID_DISC_SLOT;
+    }
+    else if (target_pfn->isOccupied == 3) {
+        if (LockedTryRemoveEntry(&pfn_standby_list, &target_pfn->list)) {
+            slot_to_free  = target_pfn->disc_index;
             target_pfn->disc_index = INVALID_DISC_SLOT;
         }
     }
-    else {
-        // Genuinely on a list. Remove it under pfn_lock so Phase 1 can't poach
-        // it in the gap. pfn → list lock order is legal in the hierarchy.
-        if (target_pfn->isOccupied == 3) {
-            LockedRemoveEntry(&pfn_standby_list, &target_pfn->list);
-        }
-        else if (target_pfn->isOccupied == 2) {
-            LockedRemoveEntry(&pfn_modified_list, &target_pfn->list);
-        }
+    else if (target_pfn->isOccupied == 2) {
+        LockedTryRemoveEntry(&pfn_modified_list, &target_pfn->list);
     }
 
-    // Mark active before releasing pfn_lock so membership and occ change together.
-    target_pfn->isOccupied = 1;
+    target_pfn->isOccupied = 1;                        // the signal disc Phase 1 re-checks
+    unlock_pfn(target_pfn);
 
-    LeaveCriticalSection(&pfn_lock);
-
-    // If it was a standby page, free its disc slot now (outside pfn_lock;
-    // disc_lock is below list locks in the hierarchy). We only reach here for
-    // the not-poached standby case; guard on a real slot.
-    if (!poached_local && target_pfn->disc_index != INVALID_DISC_SLOT) {
+    if (slot_to_free != INVALID_DISC_SLOT) {
         EnterCriticalSection(&disc_lock);
-        disc_metadata[target_pfn->disc_index].isOccupied = FALSE;
+        disc_metadata[slot_to_free].isOccupied = FALSE;
         LeaveCriticalSection(&disc_lock);
-        LockedInsertTail(&disc_free_list, &disc_metadata[target_pfn->disc_index].list);
-        target_pfn->disc_index = INVALID_DISC_SLOT;
+        LockedInsertTail(&disc_free_list, &disc_metadata[slot_to_free].list);
     }
 
     // Remap the frame and validate the PTE. Order: make PTE valid BEFORE
@@ -1367,7 +1419,10 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
         printf("CRITICAL: soft fault remap failed. Error: %lu\n", GetLastError());
         DebugBreak();
         // Return the page cleanly rather than leaking it half-activated.
+        lock_pfn(target_pfn);
+        target_pfn->disc_index = INVALID_DISC_SLOT;
         target_pfn->isOccupied = 0;
+        unlock_pfn(target_pfn);
         target_pfn->pte = NULL;
         LockedInsertTail(&pfn_free_list, &target_pfn->list);
         LeaveCriticalSection(my_pte_lock);
@@ -1378,9 +1433,9 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     set_pte_valid(pte, target_pfn->frame_number);
     pte->hardware.age = 0;
 
-    EnterCriticalSection(&pfn_lock);
+    //EnterCriticalSection(&pfn_lock);
     target_pfn->pte = pte;
-    LeaveCriticalSection(&pfn_lock);
+    //LeaveCriticalSection(&pfn_lock);
 
     ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
     if (target_pfn->list.Flink != NULL &&
@@ -1463,9 +1518,10 @@ full_virtual_memory_test_helper(int thread_number) {
     ULONG64 random_number;
     BOOL page_faulted = TRUE;
     BOOL resolved = TRUE;
+    ULONG64 runtime = (1 * (MB(1) / 1));
 
     // Now perform random access
-    while (i < (10* (MB(1) / 1))) {
+    while (i < runtime) {
 
         if (resolved) {
             // Get random number
@@ -1520,7 +1576,7 @@ full_virtual_memory_test_helper(int thread_number) {
             }
         }
 
-        if (i> 0 && i % 1000000 == 0) {
+        if (i> 0 && i % (runtime / 100) == 0) {
             printf(".");
             fflush(stdout);
         }
@@ -1543,6 +1599,131 @@ full_virtual_memory_test_helper(int thread_number) {
     printf ("full_virtual_memory_test : %d finished accessing %u random virtual addresses.\n", thread_number, i);
 }
 
+VOID
+full_virtual_memory_test_helper_not_random(int thread_number) {
+
+    THREAD_RNG_STATE thread_rng;
+    thread_rng.state = __rdtsc();
+    if (thread_rng.state == 0) thread_rng.state = 1;
+    thread_rng.counter = 0;
+
+    LARGE_INTEGER frequency, start_time, end_time;
+    double elapsed_ms;
+
+    QueryPerformanceFrequency(&frequency);
+    printf("Starting virtual memory simulation workload...for thread %i\n", thread_number);
+    QueryPerformanceCounter(&start_time);
+
+    ULONG64 total_pages = virtual_address_size_in_unsigned_chunks
+                          / (PAGE_SIZE / sizeof(ULONG_PTR));
+
+    // Ring of recently-visited bases. Revisiting these is what creates the
+    // hot/cold split that aging is supposed to detect.
+    ULONG64 hot[HOT_SPOTS] = { 0 };
+    int      hot_next = 0;
+    int      hot_count = 0;
+
+    ULONG64 base_page   = GetNextRandom(&thread_rng) % total_pages;
+    ULONG64 run_left    = 0;
+    ULONG64 cur_page    = base_page;
+
+    unsigned i = 0;
+    PVOID arbitrary_va;
+    BOOL page_faulted;
+    BOOL resolved = TRUE;
+
+    ULONG64 runtime = (10 * (MB(1) / 1));
+
+    while (i < runtime) {
+
+        if (resolved) {
+            if (run_left == 0) {
+                // Start a new run.
+                ULONG64 r = GetNextRandom(&thread_rng);
+
+                if (hot_count > 0 && (r % REVISIT_CHANCE) == 0) {
+                    // Jump back to a recent base — these pages should still be
+                    // young, and aging should keep them out of the high bins.
+                    base_page = hot[GetNextRandom(&thread_rng) % hot_count];
+                } else {
+                    // Cold jump: somewhere new entirely.
+                    base_page = GetNextRandom(&thread_rng) % total_pages;
+
+                    hot[hot_next] = base_page;
+                    hot_next = (hot_next + 1) % HOT_SPOTS;
+                    if (hot_count < HOT_SPOTS) hot_count++;
+                }
+
+                run_left = MIN_RUN_PAGES +
+                           (GetNextRandom(&thread_rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
+
+                // Don't run off the end of the VA space.
+                if (base_page + run_left > total_pages) {
+                    run_left = total_pages - base_page;
+                    if (run_left == 0) {
+                        base_page = 0;
+                        run_left  = MIN_RUN_PAGES;
+                    }
+                }
+
+                cur_page = base_page;
+            }
+
+            arbitrary_va = (PVOID)((ULONG_PTR)va_start + (cur_page * PAGE_SIZE));
+            resolved = FALSE;
+        }
+
+        page_faulted = FALSE;
+
+        __try {
+            *(PULONG_PTR)arbitrary_va = (ULONG_PTR) arbitrary_va;
+        }
+        __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+        {
+            page_faulted = TRUE;
+        }
+
+        if (page_faulted) {
+            handle_page_fault(arbitrary_va);
+            continue;   // retry the SAME va — do not advance
+        }
+
+        // Age hint, same CAS discipline as before.
+        {
+            PPTE pte = get_pte_from_va(arbitrary_va);
+            ULONG64 old_val = *(volatile ULONG64*)pte;
+
+            PTE snapshot;
+            *(PULONG64)&snapshot = old_val;
+
+            if (snapshot.hardware.valid == 1 && snapshot.hardware.age == 0) {
+                PTE updated = snapshot;
+                updated.hardware.age = 1;
+                InterlockedCompareExchange64((volatile LONG64*)pte,
+                                             *(PLONG64)&updated,
+                                             (LONG64)old_val);
+            }
+        }
+
+        // Advance within the run.
+        cur_page++;
+        run_left--;
+        resolved = TRUE;
+
+        if (i > 0 && i % (runtime/100) == 0) {
+            printf(".");
+            fflush(stdout);
+        }
+        i++;
+    }
+
+    QueryPerformanceCounter(&end_time);
+    elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
+
+    printf("\nthread %d: %u accesses in %.2f ms\n", thread_number, i, elapsed_ms);
+}
+
 DWORD WINAPI AgeThreadWorker(LPVOID lpParam) {
     HANDLE waitEvents[2] = { StartAgingEvent, ShutdownEvent };
     static ULONG64 clock_hand = 0;
@@ -1551,18 +1732,21 @@ DWORD WINAPI AgeThreadWorker(LPVOID lpParam) {
         DWORD wait = WaitForMultipleObjects(2, waitEvents, FALSE, 50);
         if (wait == WAIT_OBJECT_0 + 1) break;   // Shutdown
 
-        const ULONG64 SWEEP = 256;
+        const ULONG64 SWEEP = num_pte_regions;
         ULONG64 processed = 0;
 
         while (processed < SWEEP && processed < num_pte_regions) {
             PPTE_REGION region = &pte_regions[clock_hand];
 
             if (TryEnterCriticalSection(&region->lock)) {
+                PLIST_ENTRY bin0_head  = &region->active_age_lists[0];
+                PLIST_ENTRY bin0_stop  = bin0_head->Blink;   // last pre-existing entry
+                BOOL bin0_was_empty    = IsListEmpty(bin0_head);
 
                 // Descending is REQUIRED: we promote into bin (age+1), which
                 // we have already walked. Ascending would re-walk promoted
                 // pages and loop forever.
-                for (int age = 7; age >= 0; age--) {
+                for (int age = 7; age >= 1; age--) {
                     PLIST_ENTRY head = &region->active_age_lists[age];
                     if (IsListEmpty(head)) continue;
 
@@ -1603,26 +1787,57 @@ DWORD WINAPI AgeThreadWorker(LPVOID lpParam) {
 
                         PLIST_ENTRY next = cur->Flink;
                         pfn_metadata* pfn = GetPfnFromListEntry(cur);
+
                         PPTE pte = pfn->pte;
 
-                        if (pte != NULL && pte->hardware.valid == 1) {
-                            if (pte->hardware.age == 1) {
-                                // Recently accessed: reset the hint, demote to bin 0.
-                                pte->hardware.age = 0;
-                                if (age != 0) {
-                                    RemoveEntryList(&pfn->list);
-                                    InsertTailList(&region->active_age_lists[0], &pfn->list);
-                                }
-                                // age == 0: already in bin 0, do NOT re-insert
-                                // (that is one way to self-link a sole element).
+                        // Anything in this region's age list must be active and owned by this region.
+                        // If not, it's a state we don't own — leave it alone entirely.
+                        if (pfn->isOccupied != 1 || pte == NULL ||
+                            get_pte_lock_from_pte_pointer(pte) != &region->lock ||
+                            pte->hardware.valid != 1) {
+                            cur = next;
+                            continue;
                             }
-                            else if (age < 7) {
-                                // Untouched since last sweep: promote (older).
-                                RemoveEntryList(&pfn->list);
-                                InsertTailList(&region->active_age_lists[age + 1], &pfn->list);
-                            }
+
+                        if (pte->hardware.age == 1) {
+                            pte->hardware.age = 0;
+                        } else if (age < 7) {
+                            RemoveEntryList(&pfn->list);
+                            InsertTailList(&region->active_age_lists[age + 1], &pfn->list);
                         }
 
+                        cur = next;
+
+
+                    }
+                }
+                if (!bin0_was_empty) {
+                    PLIST_ENTRY cur = bin0_head->Flink;
+                    ULONG64 walked = 0;
+                    for (;;) {
+                        if (cur == bin0_head) break;
+                        if (++walked > NUMBER_OF_PHYSICAL_PAGES) { DebugBreak(); break; }
+                        if (cur->Flink == NULL || cur->Blink == NULL || cur->Flink == cur) { DebugBreak(); break; }
+
+                        PLIST_ENTRY next    = cur->Flink;
+                        BOOL        is_last = (cur == bin0_stop);   // check BEFORE we move it
+
+                        pfn_metadata* pfn = GetPfnFromListEntry(cur);
+                        PPTE pte = pfn->pte;
+
+                        if (pfn->isOccupied == 1 && pte != NULL &&
+                            get_pte_lock_from_pte_pointer(pte) == &region->lock &&
+                            pte->hardware.valid == 1) {
+
+                            if (pte->hardware.age == 1) {
+                                pte->hardware.age = 0;              // touched; stays in bin 0
+                            } else {
+                                RemoveEntryList(&pfn->list);
+                                InsertTailList(&region->active_age_lists[1], &pfn->list);
+                            }
+                            }
+
+                        if (is_last) break;                          // reached the snapshot boundary
                         cur = next;
                     }
                 }
@@ -1644,14 +1859,16 @@ DWORD WINAPI AgeThreadWorker(LPVOID lpParam) {
 DWORD WINAPI TrimThreadWorker(LPVOID lpParam) {
     HANDLE waitEvents[2] = { LowPagesEvent, ShutdownEvent };
 
+
     while (TRUE) {
-        DWORD waitResult = WaitForMultipleObjects(2, waitEvents, FALSE, 100);
+        DWORD waitResult = WaitForMultipleObjects(2, waitEvents, FALSE, INFINITE);
 
         if (waitResult == WAIT_OBJECT_0 + 1) {
             break; // Shutdown
         }
 
         SetEvent(StartAgingEvent);
+        WaitForSingleObject(FinishedAgingEvent, 100);
 
         while (pfn_free_list.count + pfn_standby_list.count < HIGH_WATERMARK) {
             if (WaitForSingleObject(ShutdownEvent, 0) == WAIT_OBJECT_0) return 0;
@@ -1692,46 +1909,31 @@ DWORD WINAPI DiscThreadWorker(LPVOID lpParam) {
 
                 // Phase 1: Harvest and Allocate
                 while (batch_count < DISC_BATCH) {
-
-                    // ATOMIC: remove from modified AND set the poach flag under
-                    // a single pfn_lock hold. Otherwise there is a window where
-                    // the page is off the modified list but the flag is still 0,
-                    // and a soft fault will try to remove it from modified again
-                    // (double-remove → corrupted list links).
-                    EnterCriticalSection(&pfn_lock);
                     PLIST_ENTRY mod_entry = LockedRemoveHead(&pfn_modified_list);
-                    if (mod_entry == NULL) {
-                        LeaveCriticalSection(&pfn_lock);
-                        break;
-                    }
-                    pfn_metadata* candidate = GetPfnFromListEntry(mod_entry);
-                    candidate->isBeingWrittenToDisc = 1;
-                    LeaveCriticalSection(&pfn_lock);
+                    if (mod_entry == NULL) break;
 
-                    // Guard: only well-formed modified pages belong here.
-                    if (candidate->isOccupied != 2 ||
-                        candidate->frame_number == 0 ||
-                        candidate->frame_number == INVALID_DISC_SLOT) {
-                        printf("MODLIST BAD: pfn=%p occ=%d frame=0x%llx pte=%p\n",
-                               candidate, candidate->isOccupied,
-                               (ULONG64)candidate->frame_number, candidate->pte);
-                        DebugBreak();
+                    pfn_metadata* c = GetPfnFromListEntry(mod_entry);
+                    lock_pfn(c);
+
+                    if (c->isOccupied != 2) {          // soft fault rescued it in the pop gap
+                        unlock_pfn(c);
                         continue;
                     }
 
-                    // Allocate a disc slot if this page doesn't already have one.
-                    if (candidate->disc_index == INVALID_DISC_SLOT) {
-                        candidate->disc_index = find_free_disc_slot();
-                        if (candidate->disc_index == INVALID_DISC_SLOT) {
-                            // printf("CRITICAL: Out of disc space inside DiscThreadWorker!\n");
-                            // DebugBreak();
-                            continue;   // don't batch a slotless page
+                    c->isBeingWrittenToDisc = 1;
+
+                    if (c->disc_index == INVALID_DISC_SLOT) {
+                        c->disc_index = find_free_disc_slot();
+                        if (c->disc_index == INVALID_DISC_SLOT) {
+                            c->isBeingWrittenToDisc = 0;
+                            unlock_pfn(c);
+                            LockedInsertTail(&pfn_modified_list, &c->list);   // PUT IT BACK
+                            break;
                         }
                     }
 
-
-                    batch[batch_count] = candidate;
-                    batch_count++;
+                    unlock_pfn(c);
+                    batch[batch_count++] = c;
                 }
 
                 if (batch_count == 0) {
@@ -1743,59 +1945,52 @@ DWORD WINAPI DiscThreadWorker(LPVOID lpParam) {
 
                 // Phase 3: The Aftermath
                 for (int i = 0; i < batch_count; i++) {
-                    pfn_metadata* candidate = batch[i];
+                    pfn_metadata* c = batch[i];
+                    ULONG64 slot_to_free = INVALID_DISC_SLOT;
 
-                    // First read pte under pfn_lock just to derive the region lock.
-                    EnterCriticalSection(&pfn_lock);
-                    PPTE evict_pte = candidate->pte;
-                    LeaveCriticalSection(&pfn_lock);
+                    lock_pfn(c);
+                    PPTE evict_pte = c->pte;
+                    unlock_pfn(c);
 
                     if (evict_pte == NULL) {
-                        // Poached and freed already; just reclaim the slot.
-                        EnterCriticalSection(&pfn_lock);
-                        BOOL p = (candidate->isBeingWrittenToDisc == 0);
-                        candidate->isBeingWrittenToDisc = 0;
-                        LeaveCriticalSection(&pfn_lock);
-                        // free slot ...
-                        continue;
+                        lock_pfn(c);
+                        c->isBeingWrittenToDisc = 0;
+                        slot_to_free  = c->disc_index;
+                        c->disc_index = INVALID_DISC_SLOT;
+                        unlock_pfn(c);
+                        goto free_slot;
                     }
 
                     CRITICAL_SECTION* region_lock = get_pte_lock_from_pte_pointer(evict_pte);
                     EnterCriticalSection(region_lock);
-                    EnterCriticalSection(&pfn_lock);
+                    lock_pfn(c);
 
-                    // RE-CHECK under both locks. The page may have been poached/reactivated
-                    // in the gap between deriving region_lock and acquiring it.
-                    BOOL poached = (candidate->isBeingWrittenToDisc == 0);
-                    candidate->isBeingWrittenToDisc = 0;
+                    BOOL poached = (c->isBeingWrittenToDisc == 0);
+                    c->isBeingWrittenToDisc = 0;
 
-                    // Also re-verify the PTE hasn't moved. If candidate->pte changed, the
-                    // region_lock we hold is for the WRONG region — bail to poach handling.
-                    if (poached || candidate->pte != evict_pte) {
-                        LeaveCriticalSection(&pfn_lock);
+                    if (poached || c->pte != evict_pte) {
+                        slot_to_free  = c->disc_index;
+                        c->disc_index = INVALID_DISC_SLOT;
+                        unlock_pfn(c);
                         LeaveCriticalSection(region_lock);
-
-                        // Only free the slot if we actually still hold one. A poached page may
-                        // have already had its slot freed by the soft fault that rescued it.
-                        // if (candidate->disc_index != INVALID_DISC_SLOT) {
-                        //     EnterCriticalSection(&disc_lock);
-                        //     disc_metadata[candidate->disc_index].isOccupied = FALSE;
-                        //     LeaveCriticalSection(&disc_lock);
-                        //     LockedInsertTail(&disc_free_list, &disc_metadata[candidate->disc_index].list);
-                        //     candidate->disc_index = INVALID_DISC_SLOT;
-                        // }
-                        continue;
+                        goto free_slot;
                     }
 
-                    // Safe: still ours, still not poached, PTE unchanged, region lock correct.
-                    // RESCUE MUST BE IMPOSSIBLE HERE
-                    candidate->isOccupied = 3;
-
-                    LockedInsertTail(&pfn_standby_list, &candidate->list);
+                    c->isOccupied = 3;
+                    LockedInsertTail(&pfn_standby_list, &c->list);
                     SetEvent(StandbyPageAvailableEvent);
 
-                    LeaveCriticalSection(&pfn_lock);
+                    unlock_pfn(c);
                     LeaveCriticalSection(region_lock);
+                    continue;
+
+                    free_slot:
+                        if (slot_to_free != INVALID_DISC_SLOT) {
+                            EnterCriticalSection(&disc_lock);
+                            disc_metadata[slot_to_free].isOccupied = FALSE;
+                            LeaveCriticalSection(&disc_lock);
+                            LockedInsertTail(&disc_free_list, &disc_metadata[slot_to_free].list);
+                        }
                 }
             }
         }
@@ -1828,6 +2023,10 @@ full_virtual_memory_test (
         return;
     }
 
+    printf("max_frame=%llu  slots=%llu  table=%llu MB\n",
+       max_frame_number, max_frame_number + 1,
+       ((max_frame_number + 1) * sizeof(pfn_metadata)) / MB(1));
+
     // Create auto-reset events (they automatically reset to non-signaled after a thread wakes up)
     LowPagesEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     PagesReadyForDiscEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -1851,12 +2050,12 @@ full_virtual_memory_test (
     // created workers take VA-thread-numbers 1..NUM_WORKER_THREADS.
     for (int i = 0; i < NUM_WORKER_THREADS; i++) {
         threads[i] = CreateThread(NULL, 0,
-                                  (LPTHREAD_START_ROUTINE) full_virtual_memory_test_helper,
+                                  (LPTHREAD_START_ROUTINE) full_virtual_memory_test_helper_not_random,
                                   (PVOID)(i + 1), 0, NULL);
     }
 
     // Main thread also runs the workload (thread number 0).
-    full_virtual_memory_test_helper(0);
+    full_virtual_memory_test_helper_not_random(0);
 
     // Wait for ALL created workers to finish (indices 0..NUM_WORKER_THREADS-1).
     WaitForMultipleObjects(NUM_WORKER_THREADS, &threads[0], TRUE, INFINITE);
@@ -1892,9 +2091,12 @@ full_virtual_memory_test (
     for (ULONG64 i = 0; i < num_pte_regions; i++) {
         DeleteCriticalSection(&pte_regions[i].lock); // <- Updated target
     }
-    for (int i = 0; i < PFN_LOCK_STRIPES; i++) {
-        DeleteCriticalSection(&pfn_lock_stripes[i]);
+    for (ULONG64 f = 0; f <= max_frame_number; f++) {
+        if (FRAME_IS_VALID(f)) {
+            DeleteCriticalSection(&frame_to_pfn_table[f].lock);
+        }
     }
+    free(frame_valid_bitmap);
     DeleteCriticalSection(&disc_lock);
 
     VirtualFree (va_start, 0, MEM_RELEASE);
