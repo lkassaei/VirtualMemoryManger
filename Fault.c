@@ -1,0 +1,333 @@
+//
+// Created by lilyk on 7/14/2026.
+//
+/* ============================================================================
+ *  fault.c  --  fault dispatch, soft/hard fault, standby rescue, staging slots.
+ *  Lock hierarchy: region -> page -> list -> disc.
+ * ========================================================================== */
+
+#include "Vmm.h"
+
+static VOID          handle_soft_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
+static VOID          handle_hard_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
+static pfn_metadata* pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock);
+static int           claim_staging_slot(VOID);
+static VOID          release_staging_slot(int i);
+
+
+/* --- private per-slot staging windows (hard-fault disc read-in) --- */
+static int
+claim_staging_slot(VOID) {
+    for (;;) {
+        for (int i = 0; i < STAGING_SLOTS; i++) {
+            if (InterlockedCompareExchange(&staging_in_use[i], 1, 0) == 0) {
+                return i;
+            }
+        }
+        YieldProcessor();   /* all busy — brief spin; with STAGING_SLOTS this is rare */
+    }
+}
+
+static VOID
+release_staging_slot(int i) {
+    InterlockedExchange(&staging_in_use[i], 0);
+}
+
+
+VOID
+handle_page_fault(PVOID arbitrary_va) {
+    PPTE pte = get_pte_from_va(arbitrary_va);
+    CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(arbitrary_va);
+
+    EnterCriticalSection(my_pte_lock);
+
+    if (pte->hardware.valid == 1) {                 /* another thread beat us */
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+    if (pte->transition.transition == 1) {          /* check transition BEFORE disc */
+        handle_soft_fault(pte, arbitrary_va, my_pte_lock);
+    }
+    else if (pte->disc.disc == 1) {                 /* on disc */
+        handle_hard_fault(pte, arbitrary_va, my_pte_lock);
+    }
+    else if (pte->disc.disc == 0) {                 /* fresh: first-touch */
+        handle_hard_fault(pte, arbitrary_va, my_pte_lock);
+    }
+    else {
+        printf("CRITICAL: Unrecognized PTE state!\n");
+        LeaveCriticalSection(my_pte_lock);
+        DebugBreak();
+    }
+}
+
+
+static VOID
+handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
+    /* THIS PTE's disc slot -- the data we must read back. A frame pulled from
+     * standby is a fresh frame for our VA; its previous owner's disc_index is
+     * irrelevant (pull_from_standby_safely already repointed that owner). */
+    BOOL    is_on_disc   = (pte->disc.disc == 1);
+    ULONG64 my_disc_slot = is_on_disc ? pte->disc.disc_index : INVALID_DISC_SLOT;
+
+    pfn_metadata* target_pfn = NULL;
+    while (target_pfn == NULL) {
+        PLIST_ENTRY free_entry = LockedRemoveHead(&pfn_free_list);
+        if (free_entry != NULL) {
+            target_pfn = GetPfnFromListEntry(free_entry);
+        } else {
+            target_pfn = pull_from_standby_safely(my_pte_lock);
+        }
+
+        if (target_pfn == NULL) {
+            SetEvent(LowPagesEvent);
+            LeaveCriticalSection(my_pte_lock);
+            while (pfn_free_list.count == 0 && pfn_standby_list.count == 0) {
+                WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* timeout, not INFINITE */
+            }
+            EnterCriticalSection(my_pte_lock);
+
+            /* World changed while we slept: another thread may have resolved
+             * this VA, or trim converted it to transition. Bail and let the
+             * re-fault re-dispatch. */
+            if (pte->hardware.valid == 1 || pte->transition.transition == 1) {
+                LeaveCriticalSection(my_pte_lock);
+                return;
+            }
+            is_on_disc   = (pte->disc.disc == 1);
+            my_disc_slot = is_on_disc ? pte->disc.disc_index : INVALID_DISC_SLOT;
+        }
+    }
+
+    if (pfn_free_list.count < LOWEST_PAGES) {
+        SetEvent(LowPagesEvent);
+    }
+
+    lock_pfn(target_pfn);
+    target_pfn->disc_index = INVALID_DISC_SLOT;
+    unlock_pfn(target_pfn);
+
+    int   slot       = claim_staging_slot();
+    PVOID staging_va = (char*)staging_va_start + (slot * PAGE_SIZE);
+    PVOID va_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~((ULONG_PTR)PAGE_SIZE - 1));
+
+    /* 1. Map the frame at the PRIVATE staging VA -- invisible to other threads. */
+    if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
+        release_staging_slot(slot);
+        printf("Failed to map staging window. VA %p Error: %lu\n", va_aligned, GetLastError());
+        lock_pfn(target_pfn);
+        target_pfn->isOccupied = 0;
+        target_pfn->disc_index = INVALID_DISC_SLOT;
+        unlock_pfn(target_pfn);
+        target_pfn->pte = NULL;
+        LockedInsertTail(&pfn_free_list, &target_pfn->list);
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+
+    /* 2. Fill it while it's private. */
+    if (is_on_disc && my_disc_slot != INVALID_DISC_SLOT) {
+        memcpy(staging_va, (char*)disc + (my_disc_slot * PAGE_SIZE), PAGE_SIZE);
+        EnterCriticalSection(&disc_lock);
+        disc_metadata[my_disc_slot].isOccupied = FALSE;
+        LeaveCriticalSection(&disc_lock);
+        LockedInsertTail(&disc_free_list, &disc_metadata[my_disc_slot].list);
+    } else {
+        memset(staging_va, 0, PAGE_SIZE);           /* first-touch demand-zero */
+    }
+
+    /* 3. Unmap from staging. */
+    MapUserPhysicalPages(staging_va, 1, NULL);
+    release_staging_slot(slot);
+
+    /* 4. Publish at the real VA -- first moment it's visible, data is correct. */
+    if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+        lock_pfn(target_pfn);
+        target_pfn->isOccupied = 0;
+        target_pfn->disc_index = INVALID_DISC_SLOT;
+        unlock_pfn(target_pfn);
+        target_pfn->pte = NULL;
+        LockedInsertTail(&pfn_free_list, &target_pfn->list);
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+
+    /* 5. Make the PTE valid FIRST, then activate + publish to the age list, so
+     *    no harvester ever sees occ=1 / valid=0. */
+    *(PULONG64)pte = 0;
+    set_pte_valid(pte, target_pfn->frame_number);
+    pte->hardware.age = 0;
+
+    lock_pfn(target_pfn);
+    target_pfn->isOccupied = 1;
+    unlock_pfn(target_pfn);
+
+    target_pfn->pte = pte;
+
+    ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
+    if (target_pfn->list.Flink != NULL || target_pfn->list.Blink != NULL) {
+        printf("DOUBLE INSERT: pfn=%p Flink=%p Blink=%p occ=%d pte=%p\n",
+               target_pfn, target_pfn->list.Flink, target_pfn->list.Blink,
+               (int)target_pfn->isOccupied, target_pfn->pte);
+        DebugBreak();
+    }
+    InsertTailList(&pte_regions[region_index].active_age_lists[0], &target_pfn->list);
+
+    LeaveCriticalSection(my_pte_lock);
+}
+
+
+static VOID
+handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
+    ULONG64 frame_number = pte->transition.frame_number;
+    pfn_metadata* target_pfn = find_pfn_from_frame_number(frame_number);
+
+    if (target_pfn == NULL) {
+        printf("SOFT FAULT: no PFN for frame 0x%llx pte=%p\n", frame_number, pte);
+        DebugBreak();
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+
+    lock_pfn(target_pfn);                              /* region -> page */
+
+    if (target_pfn->pte != pte) {
+        unlock_pfn(target_pfn);
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+
+    ULONG64 slot_to_free = INVALID_DISC_SLOT;
+
+    if (target_pfn->isBeingWrittenToDisc == 1) {
+        /* Poach from the disc writer. Deliberately KEEP disc_index: the disc
+         * thread's Phase 3 detects the poach (isBeingWrittenToDisc==0) and
+         * reclaims the slot there. Do NOT free it here -- double free. */
+        target_pfn->isBeingWrittenToDisc = 0;
+    }
+    else if (target_pfn->isOccupied == 3) {
+        if (LockedTryRemoveEntry(&pfn_standby_list, &target_pfn->list)) {
+            slot_to_free = target_pfn->disc_index;
+            target_pfn->disc_index = INVALID_DISC_SLOT;
+        }
+    }
+    else if (target_pfn->isOccupied == 2) {
+        LockedTryRemoveEntry(&pfn_modified_list, &target_pfn->list);
+    }
+
+    target_pfn->isOccupied = 1;                        /* signal disc Phase 1 re-checks */
+    unlock_pfn(target_pfn);
+
+    if (slot_to_free != INVALID_DISC_SLOT) {
+        EnterCriticalSection(&disc_lock);
+        disc_metadata[slot_to_free].isOccupied = FALSE;
+        LeaveCriticalSection(&disc_lock);
+        LockedInsertTail(&disc_free_list, &disc_metadata[slot_to_free].list);
+    }
+
+    PVOID va_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~((ULONG_PTR)PAGE_SIZE - 1));
+    if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+        printf("CRITICAL: soft fault remap failed. Error: %lu\n", GetLastError());
+        DebugBreak();
+        lock_pfn(target_pfn);
+        target_pfn->disc_index = INVALID_DISC_SLOT;
+        target_pfn->isOccupied = 0;
+        unlock_pfn(target_pfn);
+        target_pfn->pte = NULL;
+        LockedInsertTail(&pfn_free_list, &target_pfn->list);
+        LeaveCriticalSection(my_pte_lock);
+        return;
+    }
+
+    *(PULONG64)pte = 0;
+    set_pte_valid(pte, target_pfn->frame_number);
+    pte->hardware.age = 0;
+
+    target_pfn->pte = pte;
+
+    ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
+    if (target_pfn->list.Flink != NULL &&
+        target_pfn->list.Flink != &target_pfn->list) {
+        printf("DOUBLE INSERT: pfn=%p Flink=%p Blink=%p occ=%d pte=%p\n",
+               target_pfn, target_pfn->list.Flink, target_pfn->list.Blink,
+               (int)target_pfn->isOccupied, target_pfn->pte);
+        DebugBreak();
+    }
+    InsertTailList(&pte_regions[region_index].active_age_lists[0], &target_pfn->list);
+
+    LeaveCriticalSection(my_pte_lock);
+}
+
+
+static pfn_metadata*
+pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
+    ULONG64 attempts = 0;
+    for (;;) {
+        if (++attempts > 16) return NULL;
+
+        pfn_metadata* cand = NULL;
+        PPTE owner_pte = NULL;
+        int  skip = (int)(attempts - 1);
+
+        EnterCriticalSection(&pfn_standby_list.lock);
+        PLIST_ENTRY e = pfn_standby_list.head.Flink;
+        while (e != &pfn_standby_list.head) {
+            pfn_metadata* p = GetPfnFromListEntry(e);
+            if (p->isOccupied == 3 && p->isBeingWrittenToDisc == 0) {
+                if (skip > 0) { skip--; }
+                else { cand = p; owner_pte = p->pte; break; }
+            }
+            e = e->Flink;
+        }
+        LeaveCriticalSection(&pfn_standby_list.lock);
+
+        if (cand == NULL) return NULL;
+
+        if (owner_pte == NULL) {                        /* nothing to stamp */
+            EnterCriticalSection(&pfn_standby_list.lock);
+            if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+                cand->pte != NULL) {
+                LeaveCriticalSection(&pfn_standby_list.lock);
+                continue;
+            }
+            RemoveEntryList(&cand->list);
+            cand->list.Flink = cand->list.Blink = NULL;
+            pfn_standby_list.count--;
+            LeaveCriticalSection(&pfn_standby_list.lock);
+
+            cand->disc_index = INVALID_DISC_SLOT;
+            cand->isOccupied = 1;
+            return cand;
+        }
+
+        CRITICAL_SECTION* owner_lock = get_pte_lock_from_pte_pointer(owner_pte);
+
+        if (owner_lock != my_pte_lock) {
+            if (!TryEnterCriticalSection(owner_lock)) continue;   /* skip contended */
+        }
+
+        lock_pfn(cand);                                 /* region -> page */
+
+        if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+            cand->pte != owner_pte) {
+            unlock_pfn(cand);
+            if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+            continue;
+        }
+
+        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {   /* page -> list */
+            unlock_pfn(cand);
+            if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+            continue;
+        }
+
+        set_to_disc_state(owner_pte, cand);             /* reads disc_index BEFORE clear */
+        cand->disc_index = INVALID_DISC_SLOT;
+        cand->isOccupied = 1;
+        unlock_pfn(cand);
+
+        cand->pte = NULL;                               /* region-lock protected */
+        if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
+        return cand;
+    }
+}

@@ -1,0 +1,346 @@
+//
+// Created by lilyk on 7/14/2026.
+//
+#ifndef VMM_H
+#define VMM_H
+
+/* ============================================================================
+ *  vmm.h  --  single shared header for the virtual memory manager
+ *
+ *  Every .c file in the project does exactly:   #include "vmm.h"
+ *
+ *  This header contains ONLY:
+ *    - the platform include
+ *    - compile-time configuration (#define)
+ *    - type definitions (structs / unions / typedefs)
+ *    - extern declarations of shared globals   (defined once, in globals.c)
+ *    - static __forceinline helpers            (must live in the header)
+ *    - prototypes for cross-translation-unit functions
+ *
+ *  It contains NO function bodies (other than the inline helpers) and NO
+ *  global *definitions*. Those live in globals.c so there is exactly one
+ *  definition of each symbol -- that is what keeps the linker happy.
+ * ========================================================================== */
+
+#include <windows.h>   /* CRITICAL_SECTION, LIST_ENTRY, HANDLE, ULONG64, etc. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <intrin.h>
+
+
+/* ============================================================================
+ *  1. CONFIGURATION  (was scattered as #defines at the top of the old file)
+ * ========================================================================== */
+
+
+#define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 1
+
+#pragma comment(lib, "advapi32.lib")
+
+#if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
+#pragma comment(lib, "onecore.lib")
+#endif
+
+// Sizing constants
+#define PAGE_SIZE 4096
+#define MB(x) ((x) * 1024 * 1024)
+#define KB(x) ((x) * 1024)
+
+#define MAX_AGE_BITS 8
+
+#define NUMBER_OF_PHYSICAL_PAGES (1 * (MB(1024) / PAGE_SIZE))
+//#define NUMBER_OF_PHYSICAL_PAGES 4
+#define NUM_PTEs (VIRTUAL_ADDRESS_SIZE / PAGE_SIZE)
+#define NUM_DISC_PAGES (5 * NUMBER_OF_PHYSICAL_PAGES)
+#define MAX_DISC_PTE_BITS 40
+#define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
+#define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
+
+#define DISC_BATCH 256                       // was 64 — amortize the map/unmap syscalls
+#define MAX_TRIM_PAGES 256                   // match DISC_BATCH so one harvest = one disc batch
+#define LOWEST_PAGES (NUMBER_OF_PHYSICAL_PAGES / 64)     // ~4,096: wake trim earlier
+#define HIGH_WATERMARK (LOWEST_PAGES * 8)                // ~32,768: deeper buffer
+#define MAX_IN_FLIGHT (4 * DISC_BATCH)                   // 1,024 — auto-scales with DISC_BATCH
+
+#define PTE_REGION_SIZE 512
+
+#define PFN_LOCK_STRIPES 256
+#define PFN_LOCK(p) (&pfn_lock_stripes[(p)->frame_number & (PFN_LOCK_STRIPES - 1)])
+
+#define STAGING_SLOTS (2 * (NUM_WORKER_THREADS + 1))   // 14 for 7 faulting threads
+
+#define NUM_WORKER_THREADS 6
+
+/* NOTE: the workload-only tunables (MIN_RUN_PAGES, MAX_RUN_PAGES,
+ * REVISIT_CHANCE, HOT_SPOTS) are used only inside workload.c, so leave them
+ * defined at the top of workload.c rather than polluting this shared header. */
+
+
+/* ============================================================================
+ *  2. TYPES
+ * ========================================================================== */
+
+/* -------------------------------------------------------------------------
+ *  PTE  --  PASTE YOUR EXACT DEFINITION HERE, VERBATIM.
+ *
+ *  Do NOT let me reconstruct the bitfield widths from memory -- getting the
+ *  bit layout wrong is exactly the union-overlap aliasing bug you already
+ *  fought once. Copy the real union (hardware / transition / disc variants)
+ *  out of your current file unchanged. It must total 64 bits and be the type
+ *  that `*(PULONG64)pte = 0;` casts operate on.
+ *
+ *  Sketch of the shape (widths are placeholders -- REPLACE):
+ *
+ *      typedef struct { ULONG64 valid:1; ULONG64 frame_number:40; ... } PTE_HW;
+ *      typedef struct { ULONG64 valid:1; ULONG64 frame_number:40; ... } PTE_TRANS;
+ *      typedef struct { ULONG64 always_zero:1; ULONG64 disc:1; ...    } PTE_DISC;
+ *      typedef union  { PTE_HW hardware; PTE_TRANS transition; PTE_DISC disc; } PTE;
+ * ------------------------------------------------------------------------- */
+
+// Struct for our PTEs
+typedef struct {
+    ULONG64 valid: 1;
+    ULONG64 frame_number: 40;
+    ULONG64 age: 3;
+    ULONG64 reserved: 20;
+} VALID_PTE, *PVALID_PTE;
+
+typedef struct {
+    ULONG64 valid: 1; // = 0
+    ULONG64 transition: 1; // = 1
+    ULONG64 frame_number: 40;
+    ULONG64 reserved: 22;
+} TRANSITION_PTE, *PTRANSITION_PTE;
+
+typedef struct {
+    ULONG64 valid: 1; // = 0
+    ULONG64 transition: 1; // = 0
+    ULONG64 disc: 1; // = 1
+    ULONG64 disc_index: MAX_DISC_PTE_BITS;
+    ULONG64 reserved: 64 - MAX_DISC_PTE_BITS - 3;
+} DISC_PTE, *PDISC_PTE;
+
+typedef struct {
+    union {
+        VALID_PTE hardware;
+        TRANSITION_PTE transition;
+        DISC_PTE disc;
+    };
+} PTE, *PPTE;
+
+
+/* -------------------------------------------------------------------------
+ *  LOCKED_LIST  --  a doubly-linked list with its own lock and a count.
+ * ------------------------------------------------------------------------- */
+typedef struct _LOCKED_LIST {
+    LIST_ENTRY        head;
+    ULONG64           count;
+    CRITICAL_SECTION  lock;
+} LOCKED_LIST, *PLOCKED_LIST;
+
+
+/* -------------------------------------------------------------------------
+ *  pfn_metadata  --  one per physical frame.
+ *
+ *  Field ownership (the invariant the whole design rests on):
+ *    frame_number            immutable after setup
+ *    pte                     region lock of the PTE it points at
+ *    disc_index / isOccupied / isBeingWrittenToDisc / lock_bit
+ *                            the page's OWN lock  (they share one qword)
+ *    list                    the owning list's lock, or region lock for age lists
+ *
+ *  `lock` is the temporary per-page CRITICAL_SECTION. `lock_bit` is reserved
+ *  as its eventual 1-bit-spinlock replacement -- keeping it in the shared
+ *  qword now means the layout won't shift when you make the swap.
+ * ------------------------------------------------------------------------- */
+// Struct for our PFNs
+typedef struct {
+    LIST_ENTRY list;
+    ULONG64 frame_number;
+    PPTE pte;
+    ULONG64 disc_index: MAX_DISC_PTE_BITS;
+    ULONG64 isOccupied: 2; // 00 = free, 01 = active, 10 = modified, 11 = standby
+    ULONG64 isBeingWrittenToDisc: 1; // 0 = no 1 = yes
+    ULONG64 lock_bit: 1;              // reserved: future home of the 1-bit lock
+    ULONG64 reserved: 20;
+    CRITICAL_SECTION lock;            // delete once lock_bit works
+} pfn_metadata;
+
+
+/* -------------------------------------------------------------------------
+ *  pte_region  --  a contiguous span of PTE_REGION_SIZE PTEs sharing one lock,
+ *  plus the eight age lists for pages currently active in that region.
+ * ------------------------------------------------------------------------- */
+typedef struct _PTE_REGION {
+    CRITICAL_SECTION lock;
+    LIST_ENTRY active_age_lists[MAX_AGE_BITS];
+    ULONG64 active_page_count; // Tracks how many active pages are in this region
+} PTE_REGION, *PPTE_REGION;
+
+
+/* -------------------------------------------------------------------------
+ *  disc_metadata  --  one per disc slot. Adjust to match your current struct.
+ * ------------------------------------------------------------------------- */
+typedef struct _DISC_METADATA {
+    LIST_ENTRY list;
+    ULONG64 index;
+    BOOL isOccupied;
+} DISC_METADATA, *PDISC_METADATA;
+
+
+/* -------------------------------------------------------------------------
+ *  THREAD_RNG_STATE  --  per-thread PRNG state used by the workload.
+ * ------------------------------------------------------------------------- */
+typedef struct _THREAD_RNG_STATE {
+    ULONG64  state;
+    ULONG64  counter;
+} THREAD_RNG_STATE;
+
+
+/* ============================================================================
+ *  3. SHARED GLOBALS   (declared extern here, DEFINED once in globals.c)
+ * ========================================================================== */
+
+/* ---- page table / regions ---- */
+extern PTE         *page_table;          /* base of the PTE array            */
+extern PTE_REGION  *pte_regions;         /* array of num_pte_regions regions */
+extern ULONG64      num_pte_regions;
+
+/* ---- virtual address space ---- */
+extern PVOID        va_start;
+extern ULONG64      virtual_address_size;
+extern ULONG64      virtual_address_size_in_unsigned_chunks;
+extern PVOID         staging_va_start;          /* STAGING_SLOTS-page window */
+extern volatile LONG staging_in_use[STAGING_SLOTS];
+
+/* ---- pfn table ---- */
+extern pfn_metadata *frame_to_pfn_table; /* indexed by frame number (sparse) */
+extern ULONG64      *frame_valid_bitmap; /* 1 bit per possible frame         */
+extern ULONG64       max_frame_number;
+
+extern ULONG_PTR  physical_page_count;
+extern PULONG_PTR physical_page_numbers;
+
+/* ---- physical page lists ---- */
+extern LOCKED_LIST   pfn_free_list;
+extern LOCKED_LIST   pfn_modified_list;
+extern LOCKED_LIST   pfn_standby_list;
+
+/* ---- disc ---- */
+extern PVOID          disc;               /* the buffer (standardized name) */
+extern PVOID          temp_disc_va_start; /* DISC_BATCH-page scratch window  */
+extern PDISC_METADATA disc_metadata;
+extern LOCKED_LIST    disc_free_list;
+extern CRITICAL_SECTION disc_lock;
+extern ULONG64        disc_page_count;    /* actual size from create_page_file */
+
+/* ---- events ---- */
+extern HANDLE  StandbyPageAvailableEvent;
+extern HANDLE  LowPagesEvent;
+extern HANDLE  PagesReadyForDiscEvent;
+extern HANDLE  StartAgingEvent;
+extern HANDLE  FinishedAgingEvent;
+extern HANDLE  ShutdownEvent;
+
+
+/* ============================================================================
+ *  4. INLINE HELPERS
+ *  These MUST live in the header: they are __forceinline and are used from
+ *  more than one .c file, so each translation unit needs to see the body.
+ * ========================================================================== */
+
+static __forceinline pfn_metadata *
+GetPfnFromListEntry(PLIST_ENTRY entry) {
+    return CONTAINING_RECORD(entry, pfn_metadata, list);
+}
+
+static __forceinline VOID lock_pfn(pfn_metadata *p)   { EnterCriticalSection(&p->lock); }
+static __forceinline VOID unlock_pfn(pfn_metadata *p) { LeaveCriticalSection(&p->lock); }
+
+/* When you migrate to the 1-bit lock, ONLY these two bodies change:
+ *
+ *   #define PFN_LOCK_BIT 43   // == bit position of lock_bit in the qword
+ *   static __forceinline VOID lock_pfn(pfn_metadata *p) {
+ *       volatile LONG64 *w = (volatile LONG64 *)&p->disc_index;
+ *       while (InterlockedBitTestAndSet64(w, PFN_LOCK_BIT))
+ *           while (*w & (1LL << PFN_LOCK_BIT)) YieldProcessor();
+ *   }
+ *   static __forceinline VOID unlock_pfn(pfn_metadata *p) {
+ *       InterlockedBitTestAndReset64((volatile LONG64 *)&p->disc_index, PFN_LOCK_BIT);
+ *   }
+ *
+ * Rules that must hold before you flip it: no path takes the same page lock
+ * twice (a bit spinlock is NOT recursive), and no path holds a page lock
+ * across a syscall (e.g. MapUserPhysicalPages). */
+
+#define FRAME_IS_VALID(f)                                     \
+    (((f) <= max_frame_number) &&                             \
+     ((frame_valid_bitmap[(f) >> 6] >> ((f) & 63)) & 1ULL))
+
+
+/* ============================================================================
+ *  5. CROSS-MODULE PROTOTYPES
+ *  Only functions called from a DIFFERENT .c than the one that defines them
+ *  are listed. Purely-internal helpers (pull_from_standby_safely,
+ *  handle_soft_fault, handle_hard_fault, harvest_one_bin, get_unmap_candidates)
+ *  stay `static` inside their own .c and are intentionally NOT declared here.
+ * ========================================================================== */
+
+/* --- lists.c --- */
+VOID        InitializeLockedList(PLOCKED_LIST list);
+VOID        LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry);
+PLIST_ENTRY LockedRemoveHead(PLOCKED_LIST list);
+BOOL        LockedTryRemoveEntry(PLOCKED_LIST list, PLIST_ENTRY entry);
+
+/* --- list primitives (windows.h isn't providing these in this config) --- */
+VOID        InitializeListHead(PLIST_ENTRY ListHead);
+BOOLEAN     IsListEmpty(PLIST_ENTRY ListHead);
+VOID        InsertTailList(PLIST_ENTRY ListHead, PLIST_ENTRY Entry);
+PLIST_ENTRY RemoveHeadList(PLIST_ENTRY ListHead);
+BOOLEAN     RemoveEntryList(PLIST_ENTRY Entry);
+
+/* --- pte.c --- */
+PPTE              get_pte_from_va(PVOID va);
+PVOID             get_va_from_pte(PPTE pte);
+CRITICAL_SECTION* get_pte_lock_for_va(PVOID va);
+CRITICAL_SECTION* get_pte_lock_from_pte_pointer(PPTE pte);
+int  claim_staging_slot(VOID);
+VOID release_staging_slot(int slot);
+VOID              set_pte_valid(PPTE pte, ULONG64 frame_number);
+VOID              set_to_disc_state(PPTE pte, pfn_metadata *p);
+
+/* --- pfn.c --- */
+VOID          setup_pfn_metadata(ULONG_PTR physical_page_count,
+                                 PULONG_PTR physical_page_numbers);
+pfn_metadata *find_pfn_from_frame_number(ULONG64 frame_number);
+VOID          ensure_metadata_slot_is_committed(pfn_metadata *table_base,
+                                                ULONG64 frame_number);
+
+/* --- disc.c --- */
+PVOID   create_page_file(PULONG64 number_of_pages);
+ULONG64 find_free_disc_slot(VOID);
+VOID    write_to_disc(pfn_metadata** candidates, ULONG64 batch_count);
+
+
+/* --- fault.c --- */
+ULONG64 GetNextRandom(THREAD_RNG_STATE* rng);
+VOID  handle_page_fault(PVOID arbitrary_va);
+
+/* --- threads.c --- */
+DWORD WINAPI AgeThreadWorker(LPVOID param);
+DWORD WINAPI TrimThreadWorker(LPVOID param);
+DWORD WINAPI DiscThreadWorker(LPVOID param);
+
+/* --- rng.c --- */
+ULONG64 GetNextRandom(THREAD_RNG_STATE *rng);
+
+/* --- workload.c --- */
+VOID full_virtual_memory_test(VOID);
+VOID full_virtual_memory_test_helper(int thread_number);
+VOID full_virtual_memory_test_helper_not_random(int thread_number);
+
+/* --- main.c / setup --- */
+BOOL set_up_program(VOID);
+PVOID zero_malloc(size_t num_bytes);
+
+#endif /* VMM_H */
