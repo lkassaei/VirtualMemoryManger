@@ -87,5 +87,3 @@ write_to_disc(pfn_metadata** candidates, ULONG64 batch_count) {
 
     MapUserPhysicalPages(temp_disc_va_start, batch_count, NULL);
 }
-
-/* PASTE read_page_from_disc (or your batched read-back) here. */

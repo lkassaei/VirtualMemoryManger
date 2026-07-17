@@ -56,24 +56,29 @@ CRITICAL_SECTION* get_pte_lock_from_pte_pointer(PPTE target_pte) {
     return &pte_regions[region_index].lock;
 }
 
-/* Stamp a PTE to the VALID/hardware format for a freshly mapped frame.
- *   *(PULONG64)pte = 0;  then set valid + frame_number, clear age.
- * PASTE your exact field writes -- widths must match your union. */
-
 VOID
 set_pte_valid(PPTE pte, ULONG64 pfn) {
-    pte->hardware.valid = TRUE;
-    pte->hardware.frame_number = pfn;
+    // LK this needs to be atomic
+    // THIS WILL HAPPEN NO MATTER WHAT
+
+    // Read this in one shot
+    PTE snapshot;
+    snapshot.entire_contents = 0;
+        //ReadULong64NoFence(&pte->entire_contents);
+
+    snapshot.hardware.valid        = 1;
+    snapshot.hardware.frame_number = pfn;
+    snapshot.hardware.age          = 0;
+
+    // Write our snapshot into our pte
+    // This ensures that any other interlock operations never see a mid-write situation
+    WriteULong64NoFence(&pte->entire_contents, snapshot.entire_contents);
 }
 
 VOID
 set_pte_invalid(PPTE pte) {
     pte->hardware.valid = FALSE;
 }
-
-/* Stamp the OLD owner's PTE to DISC format when a standby frame is repurposed.
- * Reads p->disc_index -- caller must not have cleared it yet.
- * PASTE your exact field writes. */
 
 VOID
 set_to_disc_state(PPTE old_owner_pte, pfn_metadata* target_pfn) {

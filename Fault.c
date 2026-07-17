@@ -8,38 +8,27 @@
 
 #include "Vmm.h"
 
+/* Per-thread staging state. TLS: each thread gets its own copy, so slot
+ * selection needs no lock -- a thread only ever touches its own slice. */
+__declspec(thread) int t_thread_number = 0;
+__declspec(thread) int t_ring_pos      = 0;
+
 static VOID          handle_soft_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
 static VOID          handle_hard_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
 static pfn_metadata* pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock);
-static int           claim_staging_slot(VOID);
-static VOID          release_staging_slot(int i);
-
-
-/* --- private per-slot staging windows (hard-fault disc read-in) --- */
-static int
-claim_staging_slot(VOID) {
-    for (;;) {
-        for (int i = 0; i < STAGING_SLOTS; i++) {
-            if (InterlockedCompareExchange(&staging_in_use[i], 1, 0) == 0) {
-                return i;
-            }
-        }
-        YieldProcessor();   /* all busy — brief spin; with STAGING_SLOTS this is rare */
-    }
-}
-
-static VOID
-release_staging_slot(int i) {
-    InterlockedExchange(&staging_in_use[i], 0);
-}
-
 
 VOID
 handle_page_fault(PVOID arbitrary_va) {
     PPTE pte = get_pte_from_va(arbitrary_va);
     CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(arbitrary_va);
 
-    EnterCriticalSection(my_pte_lock);
+    // in handle_page_fault, replace the bare EnterCriticalSection with a timed one:
+
+    // LARGE_INTEGER t0, t1;
+    // QueryPerformanceCounter(&t0);
+    EnterCriticalSection(my_pte_lock);          // this is what blocks under contention
+    // QueryPerformanceCounter(&t1);
+    // InterlockedAdd64(&g_time_lock_wait, t1.QuadPart - t0.QuadPart);
 
     if (pte->hardware.valid == 1) {                 /* another thread beat us */
         LeaveCriticalSection(my_pte_lock);
@@ -61,15 +50,27 @@ handle_page_fault(PVOID arbitrary_va) {
     }
 }
 
+/* ============================================================================
+ *  handle_hard_fault  --  clean version, no prefetch.
+ *
+ *  Called (via handle_page_fault dispatch) when a faulting VA is either on disc
+ *  or a first-touch page. Two paths:
+ *    - demand-zero (first touch): publish directly, ONE syscall, no staging.
+ *    - disc-backed: fill through a private per-thread staging slot, then publish.
+ *
+ *  Holds my_pte_lock on entry; releases it on every exit.
+ * ========================================================================== */
 
 static VOID
 handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
+
     /* THIS PTE's disc slot -- the data we must read back. A frame pulled from
      * standby is a fresh frame for our VA; its previous owner's disc_index is
      * irrelevant (pull_from_standby_safely already repointed that owner). */
     BOOL    is_on_disc   = (pte->disc.disc == 1);
     ULONG64 my_disc_slot = is_on_disc ? pte->disc.disc_index : INVALID_DISC_SLOT;
 
+    /* ---- acquire a frame: free list, else standby, else wait ---- */
     pfn_metadata* target_pfn = NULL;
     while (target_pfn == NULL) {
         PLIST_ENTRY free_entry = LockedRemoveHead(&pfn_free_list);
@@ -81,15 +82,15 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
         if (target_pfn == NULL) {
             SetEvent(LowPagesEvent);
+            InterlockedIncrement64(&g_fault_stalls);      /* controller signal */
             LeaveCriticalSection(my_pte_lock);
             while (pfn_free_list.count == 0 && pfn_standby_list.count == 0) {
-                WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* timeout, not INFINITE */
+                WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* NOT INFINITE */
             }
             EnterCriticalSection(my_pte_lock);
 
-            /* World changed while we slept: another thread may have resolved
-             * this VA, or trim converted it to transition. Bail and let the
-             * re-fault re-dispatch. */
+            /* World changed while we slept -- another thread may have resolved
+             * this VA, or trim converted it to transition. Bail and re-dispatch. */
             if (pte->hardware.valid == 1 || pte->transition.transition == 1) {
                 LeaveCriticalSection(my_pte_lock);
                 return;
@@ -103,65 +104,94 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
         SetEvent(LowPagesEvent);
     }
 
+    /* The frame is now exclusively ours; it carries no disc slot. */
     lock_pfn(target_pfn);
     target_pfn->disc_index = INVALID_DISC_SLOT;
     unlock_pfn(target_pfn);
 
-    int   slot       = claim_staging_slot();
-    PVOID staging_va = (char*)staging_va_start + (slot * PAGE_SIZE);
     PVOID va_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~((ULONG_PTR)PAGE_SIZE - 1));
 
-    /* 1. Map the frame at the PRIVATE staging VA -- invisible to other threads. */
-    if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
-        release_staging_slot(slot);
-        printf("Failed to map staging window. VA %p Error: %lu\n", va_aligned, GetLastError());
-        lock_pfn(target_pfn);
-        target_pfn->isOccupied = 0;
-        target_pfn->disc_index = INVALID_DISC_SLOT;
-        unlock_pfn(target_pfn);
-        target_pfn->pte = NULL;
-        LockedInsertTail(&pfn_free_list, &target_pfn->list);
-        LeaveCriticalSection(my_pte_lock);
-        return;
+    /* ================================================================
+     *  FAST PATH: demand-zero (first touch). Fresh AWE frames are already
+     *  zero, and zero IS the correct content, so there is no stale-data
+     *  window -- publish directly at the real VA. ONE syscall, no staging.
+     * ================================================================ */
+    if (!is_on_disc || my_disc_slot == INVALID_DISC_SLOT) {
+        InterlockedIncrement64(&g_hard_faults_zero);
+
+        if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+            lock_pfn(target_pfn);
+            target_pfn->isOccupied = 0;
+            target_pfn->disc_index = INVALID_DISC_SLOT;
+            unlock_pfn(target_pfn);
+            target_pfn->pte = NULL;
+            LockedInsertTail(&pfn_free_list, &target_pfn->list);
+            LeaveCriticalSection(my_pte_lock);
+            return;
+        }
+        goto publish_pte;
     }
 
-    /* 2. Fill it while it's private. */
-    if (is_on_disc && my_disc_slot != INVALID_DISC_SLOT) {
+    /* ================================================================
+     *  DISC-BACKED PATH: must fill the frame from disc through a PRIVATE
+     *  per-thread staging slot before publishing, so no other thread ever
+     *  sees the real VA mapped with stale contents.
+     * ================================================================ */
+    InterlockedIncrement64(&g_hard_faults_disc);
+    {
+        /* Per-thread staging slot: no lock, no interlocked -- the thread owns
+         * its slice of the staging window, chosen by t_thread_number. */
+        int   base = t_thread_number * STAGING_SLOTS_PER_THREAD;
+        int   slot = base + t_ring_pos;
+        t_ring_pos = (t_ring_pos + 1) % STAGING_SLOTS_PER_THREAD;
+        if (slot < 0 || slot >= STAGING_SLOTS) { DebugBreak(); }   /* thread id never set */
+        PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
+
+        /* 1. map the frame at the PRIVATE staging VA -- invisible to others */
+        if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
+            printf("Failed to map staging. VA %p Error: %lu\n", va_aligned, GetLastError());
+            lock_pfn(target_pfn);
+            target_pfn->isOccupied = 0;
+            target_pfn->disc_index = INVALID_DISC_SLOT;
+            unlock_pfn(target_pfn);
+            target_pfn->pte = NULL;
+            LockedInsertTail(&pfn_free_list, &target_pfn->list);
+            LeaveCriticalSection(my_pte_lock);
+            return;
+        }
+
+        /* 2. fill from disc while private, then free the disc slot */
         memcpy(staging_va, (char*)disc + (my_disc_slot * PAGE_SIZE), PAGE_SIZE);
         EnterCriticalSection(&disc_lock);
         disc_metadata[my_disc_slot].isOccupied = FALSE;
         LeaveCriticalSection(&disc_lock);
         LockedInsertTail(&disc_free_list, &disc_metadata[my_disc_slot].list);
-    } else {
-        memset(staging_va, 0, PAGE_SIZE);           /* first-touch demand-zero */
+
+        /* 3. unmap staging BEFORE publish -- the frame must not be double-mapped
+         *    (staging + real) once it becomes trimmable. Cannot be deferred. */
+        MapUserPhysicalPages(staging_va, 1, NULL);
+
+        /* 4. publish at the real VA */
+        if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+            lock_pfn(target_pfn);
+            target_pfn->isOccupied = 0;
+            target_pfn->disc_index = INVALID_DISC_SLOT;
+            unlock_pfn(target_pfn);
+            target_pfn->pte = NULL;
+            LockedInsertTail(&pfn_free_list, &target_pfn->list);
+            LeaveCriticalSection(my_pte_lock);
+            return;
+        }
     }
 
-    /* 3. Unmap from staging. */
-    MapUserPhysicalPages(staging_va, 1, NULL);
-    release_staging_slot(slot);
-
-    /* 4. Publish at the real VA -- first moment it's visible, data is correct. */
-    if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
-        lock_pfn(target_pfn);
-        target_pfn->isOccupied = 0;
-        target_pfn->disc_index = INVALID_DISC_SLOT;
-        unlock_pfn(target_pfn);
-        target_pfn->pte = NULL;
-        LockedInsertTail(&pfn_free_list, &target_pfn->list);
-        LeaveCriticalSection(my_pte_lock);
-        return;
-    }
-
-    /* 5. Make the PTE valid FIRST, then activate + publish to the age list, so
-     *    no harvester ever sees occ=1 / valid=0. */
-    *(PULONG64)pte = 0;
-    set_pte_valid(pte, target_pfn->frame_number);
-    pte->hardware.age = 0;
+publish_pte:
+    /* ---- common tail: make PTE valid FIRST, then activate + publish to age
+     *      list, so no harvester ever sees occ=1 / valid=0. ---- */
+    set_pte_valid(pte, target_pfn->frame_number);   /* atomic; includes age=0 */
 
     lock_pfn(target_pfn);
     target_pfn->isOccupied = 1;
     unlock_pfn(target_pfn);
-
     target_pfn->pte = pte;
 
     ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
@@ -179,6 +209,8 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
 static VOID
 handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
+    InterlockedIncrement64(&g_soft_faults);
+
     ULONG64 frame_number = pte->transition.frame_number;
     pfn_metadata* target_pfn = find_pfn_from_frame_number(frame_number);
 
@@ -330,4 +362,106 @@ pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
         if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
         return cand;
     }
+}
+
+
+
+VOID
+handle_page_fault_run(PVOID base_va, ULONG64 run_ahead) {
+    PPTE base_pte = get_pte_from_va(base_va);
+    CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(base_va);
+
+    /* Clamp the batch so it never crosses this PTE's region boundary
+     * (crossing would need a second region lock -> ABBA risk). */
+    ULONG64 pte_index      = (ULONG64)(base_pte - page_table);
+    ULONG64 region_end     = ((pte_index / PTE_REGION_SIZE) + 1) * PTE_REGION_SIZE;
+    ULONG64 room_in_region = region_end - pte_index;               /* PTEs left in region */
+    ULONG64 want = run_ahead + 1;                                  /* this page + prefetch */
+    if (want > room_in_region) want = room_in_region;
+    if (want > MAX_PREFETCH + 1) want = MAX_PREFETCH + 1;
+
+    EnterCriticalSection(my_pte_lock);
+
+    /* Collect the contiguous run of pages that are FAULTS OF THE SAME KIND
+     * starting at base. Stop at the first page that's valid / transition /
+     * different-state -- the batch only covers uniform demand-zero (or uniform
+     * disc, but disc needs per-page disc_index, so start with demand-zero). */
+    PPTE   pte_batch[MAX_PREFETCH + 1];
+    PVOID  va_batch[MAX_PREFETCH + 1];
+    int    m = 0;
+
+    for (ULONG64 i = 0; i < want; i++) {
+        PPTE p = base_pte + i;
+        if (p->hardware.valid == 1) break;          /* already mapped: stop the run */
+        if (p->transition.transition == 1) break;   /* soft-fault case: handle singly */
+        /* demand-zero only for the batch fast path: */
+        if (p->disc.disc == 1) break;               /* on disc: needs per-page read, stop */
+
+        pte_batch[m] = p;
+        va_batch[m]  = (PVOID)((ULONG_PTR)base_va + i * PAGE_SIZE);
+        m++;
+    }
+
+    if (m == 0) {
+        /* base page wasn't a demand-zero fault -- fall back to the single path,
+         * still under the lock we hold. */
+        LeaveCriticalSection(my_pte_lock);
+        handle_page_fault(base_va);   /* re-dispatches; it re-takes the lock */
+        return;
+    }
+
+    /* Acquire up to m frames. Take what we can; don't stall for all m. */
+    pfn_metadata* frames[MAX_PREFETCH + 1];
+    int got = 0;
+    for (; got < m; got++) {
+        PLIST_ENTRY e = LockedRemoveHead(&pfn_free_list);
+        if (e == NULL) {
+            pfn_metadata* p = pull_from_standby_safely(my_pte_lock);
+            if (p == NULL) break;                   /* out of frames; publish what we have */
+            frames[got] = p;
+        } else {
+            frames[got] = GetPfnFromListEntry(e);
+        }
+    }
+
+    if (got == 0) {
+        /* couldn't get even one frame -- fall back to single path which has the
+         * proper wait-for-page loop. */
+        LeaveCriticalSection(my_pte_lock);
+        handle_page_fault(base_va);
+        return;
+    }
+
+    /* Demand-zero: frames are already zero (fresh AWE) -- no fill needed.
+     * Publish all `got` frames at their real VAs in ONE scatter. */
+    ULONG_PTR frame_numbers[MAX_PREFETCH + 1];
+    for (int i = 0; i < got; i++) frame_numbers[i] = frames[i]->frame_number;
+
+    if (MapUserPhysicalPagesScatter(va_batch, got, frame_numbers) == FALSE) {
+        /* scatter failed: return frames, fall back */
+        for (int i = 0; i < got; i++) {
+            frames[i]->isOccupied = 0;
+            LockedInsertTail(&pfn_free_list, &frames[i]->list);
+        }
+        LeaveCriticalSection(my_pte_lock);
+        handle_page_fault(base_va);
+        return;
+    }
+
+    /* Stamp PTEs valid + publish pfns to the age list. */
+    ULONG64 region_index = pte_index / PTE_REGION_SIZE;
+    for (int i = 0; i < got; i++) {
+        set_pte_valid(pte_batch[i], frames[i]->frame_number);   /* atomic, age=0 */
+
+        lock_pfn(frames[i]);
+        frames[i]->isOccupied = 1;
+        unlock_pfn(frames[i]);
+        frames[i]->pte = pte_batch[i];
+
+        InsertTailList(&pte_regions[region_index].active_age_lists[0], &frames[i]->list);
+    }
+
+    if (pfn_free_list.count < LOWEST_PAGES) SetEvent(LowPagesEvent);
+
+    LeaveCriticalSection(my_pte_lock);
 }

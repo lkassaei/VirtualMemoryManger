@@ -62,14 +62,26 @@
 #define HIGH_WATERMARK (LOWEST_PAGES * 8)                // ~32,768: deeper buffer
 #define MAX_IN_FLIGHT (4 * DISC_BATCH)                   // 1,024 — auto-scales with DISC_BATCH
 
+#define MAX_PREFETCH 1
+
 #define PTE_REGION_SIZE 512
 
 #define PFN_LOCK_STRIPES 256
 #define PFN_LOCK(p) (&pfn_lock_stripes[(p)->frame_number & (PFN_LOCK_STRIPES - 1)])
 
-#define STAGING_SLOTS (2 * (NUM_WORKER_THREADS + 1))   // 14 for 7 faulting threads
+#define STAGING_SLOTS_PER_THREAD  8
+#define STAGING_SLOTS  ((NUM_WORKER_THREADS + 1) * STAGING_SLOTS_PER_THREAD)
 
 #define NUM_WORKER_THREADS 6
+
+/* bounds so the controller can't run away */
+#define TRIM_TARGET_MIN   (NUMBER_OF_PHYSICAL_PAGES / 64)   /* ~4K  floor */
+#define TRIM_TARGET_MAX   (NUMBER_OF_PHYSICAL_PAGES / 8)    /* ~32K ceiling */
+#define TRIM_TARGET_STEP  1024                               /* small steps */
+
+/* hysteresis: stalls-per-interval thresholds */
+#define STALL_HIGH   100    /* above this: trimmer is behind, trim harder  */
+#define STALL_LOW    5      /* below this: trimmer is ahead, back off      */
 
 /* NOTE: the workload-only tunables (MIN_RUN_PAGES, MAX_RUN_PAGES,
  * REVISIT_CHANCE, HOT_SPOTS) are used only inside workload.c, so leave them
@@ -80,29 +92,12 @@
  *  2. TYPES
  * ========================================================================== */
 
-/* -------------------------------------------------------------------------
- *  PTE  --  PASTE YOUR EXACT DEFINITION HERE, VERBATIM.
- *
- *  Do NOT let me reconstruct the bitfield widths from memory -- getting the
- *  bit layout wrong is exactly the union-overlap aliasing bug you already
- *  fought once. Copy the real union (hardware / transition / disc variants)
- *  out of your current file unchanged. It must total 64 bits and be the type
- *  that `*(PULONG64)pte = 0;` casts operate on.
- *
- *  Sketch of the shape (widths are placeholders -- REPLACE):
- *
- *      typedef struct { ULONG64 valid:1; ULONG64 frame_number:40; ... } PTE_HW;
- *      typedef struct { ULONG64 valid:1; ULONG64 frame_number:40; ... } PTE_TRANS;
- *      typedef struct { ULONG64 always_zero:1; ULONG64 disc:1; ...    } PTE_DISC;
- *      typedef union  { PTE_HW hardware; PTE_TRANS transition; PTE_DISC disc; } PTE;
- * ------------------------------------------------------------------------- */
-
 // Struct for our PTEs
 typedef struct {
     ULONG64 valid: 1;
     ULONG64 frame_number: 40;
-    ULONG64 age: 3;
-    ULONG64 reserved: 20;
+    ULONG64 age: 1; // Since age is now stored in lists within pte regions, I only need to set to 1 on access
+    ULONG64 reserved: 22;
 } VALID_PTE, *PVALID_PTE;
 
 typedef struct {
@@ -125,6 +120,7 @@ typedef struct {
         VALID_PTE hardware;
         TRANSITION_PTE transition;
         DISC_PTE disc;
+        ULONG64 entire_contents; // How we can read the entire thing in one shot
     };
 } PTE, *PPTE;
 
@@ -179,7 +175,7 @@ typedef struct _PTE_REGION {
 
 
 /* -------------------------------------------------------------------------
- *  disc_metadata  --  one per disc slot. Adjust to match your current struct.
+ *  disc_metadata
  * ------------------------------------------------------------------------- */
 typedef struct _DISC_METADATA {
     LIST_ENTRY list;
@@ -211,7 +207,6 @@ extern PVOID        va_start;
 extern ULONG64      virtual_address_size;
 extern ULONG64      virtual_address_size_in_unsigned_chunks;
 extern PVOID         staging_va_start;          /* STAGING_SLOTS-page window */
-extern volatile LONG staging_in_use[STAGING_SLOTS];
 
 /* ---- pfn table ---- */
 extern pfn_metadata *frame_to_pfn_table; /* indexed by frame number (sparse) */
@@ -241,6 +236,20 @@ extern HANDLE  PagesReadyForDiscEvent;
 extern HANDLE  StartAgingEvent;
 extern HANDLE  FinishedAgingEvent;
 extern HANDLE  ShutdownEvent;
+
+extern __declspec(thread) int t_thread_number;
+extern __declspec(thread) int t_ring_pos;
+
+extern volatile LONG64 g_hard_faults_disc;
+extern volatile LONG64 g_hard_faults_zero;
+extern volatile LONG64 g_soft_faults;
+extern volatile LONG64 g_trim_unmaps;
+extern volatile LONG64 g_time_lock_wait;
+
+
+/* ---- controller state (for dynamic trimmer) ---- */
+extern volatile LONG64 g_fault_stalls;
+extern ULONG64 g_trim_target;
 
 
 /* ============================================================================
@@ -338,6 +347,7 @@ ULONG64 GetNextRandom(THREAD_RNG_STATE *rng);
 VOID full_virtual_memory_test(VOID);
 VOID full_virtual_memory_test_helper(int thread_number);
 VOID full_virtual_memory_test_helper_not_random(int thread_number);
+VOID handle_page_fault_run(PVOID base_va, ULONG64 run_ahead);
 
 /* --- main.c / setup --- */
 BOOL set_up_program(VOID);

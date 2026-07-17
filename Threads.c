@@ -1,6 +1,3 @@
-//
-// Created by lilyk on 7/14/2026.
-//
 /* ============================================================================
  *  threads.c  --  the three background workers plus the trim harvesters.
  *
@@ -11,7 +8,7 @@
  *  DiscThreadWorker : writes the mod list to disc, publishes frames to standby.
  * ========================================================================== */
 
-#include "Vmm.h"
+#include "vmm.h"
 
 /* Forward declarations: these are defined below their callers, so they need
  * to be declared first. Both are file-local (static). */
@@ -92,19 +89,36 @@ AgeThreadWorker(LPVOID lpParam) {
                         pfn_metadata* pfn = GetPfnFromListEntry(cur);
                         PPTE pte = pfn->pte;
 
+                        /* SNAPSHOT the PTE once. Every check and the promote/clear
+                         * decision below reads from this single captured value, so
+                         * the whole decision reflects one consistent instant even
+                         * though the workload can CAS the age bit without the lock. */
+                        if (pte == NULL) { cur = next; continue; }
+                        ULONG64 ov = *(volatile ULONG64*)pte;
+                        PTE s; *(PULONG64)&s = ov;
+
                         /* Anything in this region's age list must be active and
                          * owned by this region. If not, it's a state we don't
                          * own -- leave it alone entirely. */
-                        if (pfn->isOccupied != 1 || pte == NULL ||
+                        if (pfn->isOccupied != 1 ||
                             get_pte_lock_from_pte_pointer(pte) != &region->lock ||
-                            pte->hardware.valid != 1) {
+                            s.hardware.valid != 1) {
                             cur = next;
                             continue;
                         }
 
-                        if (pte->hardware.age == 1) {
-                            pte->hardware.age = 0;
+                        if (s.hardware.age == 1) {
+                            /* Clear the reference bit with a single CAS. It shares
+                             * the bit with the lockless workload setter, so a plain
+                             * write could clobber a concurrent set. No loop: if the
+                             * CAS fails the PTE changed (re-touched, or trimmed) and
+                             * doing nothing is correct -- re-evaluated next sweep. */
+                            PTE u = s;
+                            u.hardware.age = 0;
+                            InterlockedCompareExchange64((volatile LONG64*)pte,
+                                                         *(PLONG64)&u, (LONG64)ov);
                         } else if (age < 7) {
+                            /* Untouched since last sweep -> promote toward eviction. */
                             RemoveEntryList(&pfn->list);
                             InsertTailList(&region->active_age_lists[age + 1], &pfn->list);
                         }
@@ -128,15 +142,27 @@ AgeThreadWorker(LPVOID lpParam) {
                         pfn_metadata* pfn = GetPfnFromListEntry(cur);
                         PPTE pte = pfn->pte;
 
-                        if (pfn->isOccupied == 1 && pte != NULL &&
-                            get_pte_lock_from_pte_pointer(pte) == &region->lock &&
-                            pte->hardware.valid == 1) {
+                        if (pte != NULL) {
+                            /* Snapshot once; decide from the local. */
+                            ULONG64 ov = *(volatile ULONG64*)pte;
+                            PTE s; *(PULONG64)&s = ov;
 
-                            if (pte->hardware.age == 1) {
-                                pte->hardware.age = 0;              /* touched; stays in bin 0 */
-                            } else {
-                                RemoveEntryList(&pfn->list);
-                                InsertTailList(&region->active_age_lists[1], &pfn->list);
+                            if (pfn->isOccupied == 1 &&
+                                get_pte_lock_from_pte_pointer(pte) == &region->lock &&
+                                s.hardware.valid == 1) {
+
+                                if (s.hardware.age == 1) {
+                                    /* Touched; clear the ref bit (CAS, no loop) and
+                                     * keep the page in bin 0. */
+                                    PTE u = s;
+                                    u.hardware.age = 0;
+                                    InterlockedCompareExchange64((volatile LONG64*)pte,
+                                                                 *(PLONG64)&u, (LONG64)ov);
+                                } else {
+                                    /* Untouched -> promote out of bin 0. */
+                                    RemoveEntryList(&pfn->list);
+                                    InsertTailList(&region->active_age_lists[1], &pfn->list);
+                                }
                             }
                         }
 
@@ -165,35 +191,53 @@ AgeThreadWorker(LPVOID lpParam) {
  *  On LowPagesEvent: run a full aging sweep (and WAIT for it), then harvest
  *  victims until we're back above HIGH_WATERMARK or there's nothing to take.
  * ======================================================================== */
-DWORD WINAPI
-TrimThreadWorker(LPVOID lpParam) {
-    UNREFERENCED_PARAMETER(lpParam);
+
+DWORD WINAPI TrimThreadWorker(LPVOID lpParam) {
     HANDLE waitEvents[2] = { LowPagesEvent, ShutdownEvent };
+    g_trim_target = HIGH_WATERMARK;   /* start at your old fixed value */
+    static LONG64 g_last_stall_snapshot = 0;
 
     while (TRUE) {
-        DWORD waitResult = WaitForMultipleObjects(2, waitEvents, FALSE, INFINITE);
-        if (waitResult == WAIT_OBJECT_0 + 1) break;   /* Shutdown */
+        DWORD w = WaitForMultipleObjects(2, waitEvents, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0 + 1) break;
+
+        /* --- CONTROLLER: adjust target based on stalls since last wake --- */
+        LONG64 now    = g_fault_stalls;
+        LONG64 stalls = now - g_last_stall_snapshot;
+        g_last_stall_snapshot = now;
+
+        if (stalls > STALL_HIGH) {
+            /* faulting threads are starving -> trim more aggressively */
+            g_trim_target += TRIM_TARGET_STEP;
+            if (g_trim_target > TRIM_TARGET_MAX) g_trim_target = TRIM_TARGET_MAX;
+        } else if (stalls < STALL_LOW) {
+            /* trimmer is ahead -> back off so we stop over-evicting hot pages */
+            if (g_trim_target > TRIM_TARGET_MIN + TRIM_TARGET_STEP)
+                g_trim_target -= TRIM_TARGET_STEP;
+            else
+                g_trim_target = TRIM_TARGET_MIN;
+        }
+        //
+        // printf("[trim] stalls=%lld target=%llu free=%lld standby=%lld\n",
+        //        stalls, g_trim_target, pfn_free_list.count, pfn_standby_list.count);
+        /* between STALL_LOW and STALL_HIGH: dead zone, change nothing */
 
         SetEvent(StartAgingEvent);
         WaitForSingleObject(FinishedAgingEvent, 100);
 
-        while (pfn_free_list.count + pfn_standby_list.count < HIGH_WATERMARK) {
+        /* harvest toward the DYNAMIC target instead of the fixed watermark */
+        while (pfn_free_list.count + pfn_standby_list.count < g_trim_target) {
             if (WaitForSingleObject(ShutdownEvent, 0) == WAIT_OBJECT_0) return 0;
 
-            /* Don't outrun the disc thread -- but don't stop working either. */
             if (pfn_modified_list.count >= MAX_IN_FLIGHT) {
                 SetEvent(PagesReadyForDiscEvent);
-                Sleep(0);                 /* yield; let disc drain */
+                Sleep(0);
                 continue;
             }
 
             int batch_count = 0;
             get_unmap_candidates(&batch_count, MAX_TRIM_PAGES);
-
-            if (batch_count == 0) {
-                break;   /* genuinely nothing harvestable; retry on next wake */
-            }
-
+            if (batch_count == 0) break;
             SetEvent(PagesReadyForDiscEvent);
         }
     }
@@ -319,20 +363,94 @@ DiscThreadWorker(LPVOID lpParam) {
  *  TRIM HARVESTERS  (file-local)
  * ======================================================================== */
 
+/* Collect harvestable pages from one bin into the caller's arrays.
+ * Does NOT unmap or stamp -- caller does that once per region, under the
+ * region lock. Caller must hold region->lock. Returns with *n advanced. */
+static VOID
+collect_from_bin(PPTE_REGION region, PLIST_ENTRY head,
+                 pfn_metadata** candidates, PVOID* unmap_vas,
+                 ULONG64* saved_frames, int* n, int batch_size) {
+    while (!IsListEmpty(head) && *n < batch_size) {
+        PLIST_ENTRY entry = RemoveHeadList(head);
+        entry->Flink = NULL;
+        entry->Blink = NULL;
+
+        pfn_metadata* candidate = GetPfnFromListEntry(entry);
+        PPTE evict_pte = candidate->pte;
+
+        /* only harvest genuinely active pages owned by THIS region */
+        if (evict_pte == NULL ||
+            evict_pte->hardware.valid != 1 ||
+            candidate->isOccupied != 1 ||
+            get_pte_lock_from_pte_pointer(evict_pte) != &region->lock) {
+            printf("HARVEST STALE: pfn=%p occ=%d pte=%p\n",
+                   candidate, (int)candidate->isOccupied, evict_pte);
+            DebugBreak();
+            continue;   /* already unlinked; drop it */
+            }
+
+        candidates[*n]   = candidate;
+        unmap_vas[*n]    = get_va_from_pte(evict_pte);
+        saved_frames[*n] = candidate->frame_number;
+        (*n)++;
+    }
+}
+
 static VOID
 get_unmap_candidates(int* batch_count, int batch_size) {
     static ULONG64 current_trim_region = 0;
     ULONG64 regions_checked = 0;
+    *batch_count = 0;
 
-    /* Pass 1: bins 7..1 across the sweep. */
     while (*batch_count < batch_size && regions_checked < num_pte_regions) {
         PPTE_REGION region = &pte_regions[current_trim_region];
 
         if (TryEnterCriticalSection(&region->lock)) {
-            for (int age = 7; age >= 1 && *batch_count < batch_size; age--) {
-                harvest_one_bin(region, &region->active_age_lists[age],
-                                batch_count, batch_size);
+
+            pfn_metadata* candidates[MAX_TRIM_PAGES];
+            PVOID         unmap_vas[MAX_TRIM_PAGES];
+            ULONG64       saved_frames[MAX_TRIM_PAGES];
+            int           n = 0;
+
+            /* collect across all bins of THIS region into one array */
+            for (int age = 7; age >= 1 && n < batch_size; age--) {
+                collect_from_bin(region, &region->active_age_lists[age],
+                                 candidates, unmap_vas, saved_frames, &n, batch_size);
             }
+
+            if (n > 0) {
+                /* ONE scatter unmap for the whole region's harvest, still
+                 * under region->lock -- no faulting thread can touch these
+                 * VAs because they'd need this same lock. */
+                if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
+                    printf("CRITICAL: batch unmap failed n=%d err=%lu\n", n, GetLastError());
+                    DebugBreak();
+                    /* mappings still live -- put pages back, stamp nothing */
+                    for (int i = 0; i < n; i++) {
+                        InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
+                    }
+                    n = 0;
+                }
+                InterlockedAdd64(&g_trim_unmaps, n);
+
+                /* stamp PTEs to TRANSITION + publish to modified list */
+                for (int i = 0; i < n; i++) {
+                    pfn_metadata* c = candidates[i];
+                    PPTE evict_pte = c->pte;
+                    *(PULONG64)evict_pte = 0;
+                    evict_pte->transition.valid        = 0;
+                    evict_pte->transition.transition   = 1;
+                    evict_pte->transition.frame_number = saved_frames[i];
+
+                    lock_pfn(c);
+                    c->isOccupied = 2;
+                    unlock_pfn(c);
+                    LockedInsertTail(&pfn_modified_list, &c->list);
+                }
+
+                *batch_count += n;
+            }
+
             LeaveCriticalSection(&region->lock);
         }
 
@@ -340,97 +458,48 @@ get_unmap_candidates(int* batch_count, int batch_size) {
         regions_checked++;
     }
 
-    /* Pass 2 (last resort): the full sweep found NOTHING in bins 7..1. Take
-     * bin 0 from any region we can lock, rather than starving. If this fires
-     * often, aging isn't keeping up -- raise the age SWEEP size first. */
+    /* Pass 2 (last resort): bin 0, same per-region batching. Only if nothing
+     * was found in bins 7..1 across the whole sweep. */
     if (*batch_count == 0) {
         regions_checked = 0;
         while (*batch_count < batch_size && regions_checked < num_pte_regions) {
             PPTE_REGION region = &pte_regions[current_trim_region];
-
             if (TryEnterCriticalSection(&region->lock)) {
-                harvest_one_bin(region, &region->active_age_lists[0],
-                                batch_count, batch_size);
+
+                pfn_metadata* candidates[MAX_TRIM_PAGES];
+                PVOID         unmap_vas[MAX_TRIM_PAGES];
+                ULONG64       saved_frames[MAX_TRIM_PAGES];
+                int           n = 0;
+
+                collect_from_bin(region, &region->active_age_lists[0],
+                                 candidates, unmap_vas, saved_frames, &n, batch_size);
+
+                if (n > 0) {
+                    if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
+                        DebugBreak();
+                        for (int i = 0; i < n; i++)
+                            InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
+                        n = 0;
+                    }
+                    InterlockedAdd64(&g_trim_unmaps, n);
+                    for (int i = 0; i < n; i++) {
+                        pfn_metadata* c = candidates[i];
+                        PPTE evict_pte = c->pte;
+                        *(PULONG64)evict_pte = 0;
+                        evict_pte->transition.valid        = 0;
+                        evict_pte->transition.transition   = 1;
+                        evict_pte->transition.frame_number = saved_frames[i];
+                        lock_pfn(c);
+                        c->isOccupied = 2;
+                        unlock_pfn(c);
+                        LockedInsertTail(&pfn_modified_list, &c->list);
+                    }
+                    *batch_count += n;
+                }
                 LeaveCriticalSection(&region->lock);
             }
-
             current_trim_region = (current_trim_region + 1) % num_pte_regions;
             regions_checked++;
         }
     }
-}
-
-/* Caller must hold region->lock. */
-static VOID
-harvest_one_bin(PPTE_REGION region, PLIST_ENTRY head,
-                int* batch_count, int batch_size) {
-    UNREFERENCED_PARAMETER(region);
-
-    pfn_metadata* candidates[MAX_TRIM_PAGES];
-    PVOID         unmap_vas[MAX_TRIM_PAGES];
-    ULONG64       saved_frames[MAX_TRIM_PAGES];
-    int           n = 0;
-
-    /* ---- PASS 1: collect. Do NOT touch PTEs or unmap yet. ---- */
-    while (!IsListEmpty(head) && (*batch_count + n) < batch_size && n < MAX_TRIM_PAGES) {
-        PLIST_ENTRY entry = RemoveHeadList(head);
-        entry->Flink = NULL;          /* keep the unlinked-marker discipline */
-        entry->Blink = NULL;
-
-        pfn_metadata* candidate = GetPfnFromListEntry(entry);
-        PPTE evict_pte = candidate->pte;
-
-        /* Guard: only harvest genuinely active pages with valid PTEs. */
-        if (evict_pte == NULL ||
-            evict_pte->hardware.valid != 1 ||
-            candidate->isOccupied != 1) {
-            printf("HARVEST STALE: pfn=%p occ=%d pte=%p valid=%d frame=0x%llx\n",
-                   candidate, (int)candidate->isOccupied, evict_pte,
-                   evict_pte ? (int)evict_pte->hardware.valid : -1,
-                   (ULONG64)candidate->frame_number);
-            DebugBreak();
-            continue;   /* already unlinked; drop it */
-        }
-
-        candidates[n]   = candidate;
-        unmap_vas[n]    = get_va_from_pte(evict_pte);
-        saved_frames[n] = candidate->frame_number;
-        n++;
-    }
-
-    if (n == 0) {
-        return;
-    }
-
-    /* ---- PASS 2: ONE batched unmap. All mappings die here, together.
-     * Safe: every VA belongs to THIS region, whose lock we hold, so no
-     * faulting thread can be mid-access on any of them. ---- */
-    if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
-        printf("CRITICAL: Batch unmap failed. n=%d Error: %lu\n", n, GetLastError());
-        DebugBreak();
-        /* Do NOT stamp PTEs if the unmap failed -- the mappings are still live.
-         * Put the pages back on the age list so we don't leak them. */
-        for (int i = 0; i < n; i++) {
-            InsertTailList(head, &candidates[i]->list);
-        }
-        return;
-    }
-
-    /* ---- PASS 3: nothing is mapped now -- stamp PTEs and publish. ---- */
-    for (int i = 0; i < n; i++) {
-        pfn_metadata* candidate = candidates[i];
-        PPTE evict_pte = candidate->pte;
-
-        *(PULONG64)evict_pte = 0;
-        evict_pte->transition.valid        = 0;
-        evict_pte->transition.transition   = 1;
-        evict_pte->transition.frame_number = saved_frames[i];
-
-        lock_pfn(candidate);
-        candidate->isOccupied = 2;        /* set BEFORE the insert */
-        unlock_pfn(candidate);
-        LockedInsertTail(&pfn_modified_list, &candidate->list);
-    }
-
-    *batch_count += n;
 }

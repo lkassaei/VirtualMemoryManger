@@ -24,7 +24,6 @@ PVOID   va_start                                = NULL;
 ULONG64 virtual_address_size                    = 0;
 ULONG64 virtual_address_size_in_unsigned_chunks = 0;
 PVOID         staging_va_start = NULL;
-volatile LONG staging_in_use[STAGING_SLOTS];   /* zero-init by default */
 
 /* ---- pfn table ---- */
 pfn_metadata *frame_to_pfn_table = NULL;
@@ -38,6 +37,16 @@ PULONG_PTR physical_page_numbers = NULL;
 LOCKED_LIST  pfn_free_list;
 LOCKED_LIST  pfn_modified_list;
 LOCKED_LIST  pfn_standby_list;
+
+volatile LONG64 g_hard_faults_disc = 0;
+volatile LONG64 g_hard_faults_zero = 0;
+volatile LONG64 g_soft_faults      = 0;
+volatile LONG64 g_trim_unmaps      = 0;
+volatile LONG64 g_time_lock_wait = 0;
+
+/* ---- controller state (for dynamic trimmer) ---- */
+volatile LONG64 g_fault_stalls = 0;
+ULONG64 g_trim_target = 0;
 
 /* ---- disc ---- */
 PVOID           disc               = NULL;

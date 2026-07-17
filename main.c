@@ -8,11 +8,39 @@
  *  down. main() just calls the driver.
  * ========================================================================== */
 
+// DEBUGGER CHEATSHEET
+// Left 8 digit number = start address, right = end address
+// ? = equation/quick math
+// lm = list module (lists all modules and where they are)
+// ln = list near (give any address, and it will give which variable it belongs to)
+// r = registers (shows all the cpu registers and the values within those registers and their variables/locations/instruction)
+// kn = stack trace (current stack pointer (at top of VA space), return address (location of var it's returning to), and the function it is in (called call site))
+// dv = dump variables (will show locations and values of all variables local to the function)
+// bp = breakpoint (set breakpoint at function. ex: bp vmTest!main)
+// g = go until breakpoint, completion, or crash
+// u = unasemble (tells all the future instructions in your function)
+// bl = lists all your breakpoints
+// dd = Tries to show you the contents at an address
+// .f+ go to next frame (who was the function before me?)
+// dq = dump quad (dumps the values of 8 byte chunks at address specified)
+// .logopen (opens text file with all the output of the debugger)
+// .logclose
+// gh = go ahead (degugger don't worry just continue)
+// sxd av = (av = access violation) (tells debugger to stop breaking on this particular exception)
+// !vprot = (tells you if its legit and gives you the address for the memory allocation and the state ex. MEM_RESERVE, etc.)
+// q = quit process
+// bd = remove breakpoint (ex. bd 1 removes breakpoint 1)
+// ?? var_name = gives value of that variable
+// x = see list of globals
+
+// Performance trace cheat sheet
+// xperf -on base -stackwalk profile
+// Then run your program
+// xperf -stop -d trace1.etl
+// trace1.etl
+
 #include "Vmm.h"
 
-/* -------------------------------------------------------------------------
- *  Enable SeLockMemoryPrivilege -- required for the AWE physical-page APIs.
- * ------------------------------------------------------------------------- */
 static BOOL
 GetPrivilege(VOID) {
     struct {
@@ -291,6 +319,20 @@ full_virtual_memory_test(VOID) {
     printf("WORKLOAD COMPLETE\n");
     printf("Total execution time: %.2f ms\n", elapsed_ms);
     printf("==============================================\n\n");
+
+    printf("faults: hard_disc=%lld hard_zero=%lld soft=%lld | trim_unmaps=%lld\n",
+       g_hard_faults_disc, g_hard_faults_zero, g_soft_faults, g_trim_unmaps);
+
+    // printf("phys=%u free=%lld standby=%lld modified=%lld active(est)=%lld\n",
+    //    NUMBER_OF_PHYSICAL_PAGES,
+    //    pfn_free_list.count, pfn_standby_list.count, pfn_modified_list.count,
+    //    (LONG64)NUMBER_OF_PHYSICAL_PAGES - pfn_free_list.count
+    //        - pfn_standby_list.count - pfn_modified_list.count);
+    //
+    // LARGE_INTEGER freq;
+    // QueryPerformanceFrequency(&freq);
+    // printf("lock_wait total: %.1f ms\n",
+    //        (double)g_time_lock_wait * 1000.0 / freq.QuadPart);
 
     /* ---- teardown ---- */
     for (ULONG64 i = 0; i < num_pte_regions; i++) {

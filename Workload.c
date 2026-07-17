@@ -17,12 +17,13 @@
 
 #ifndef MIN_RUN_PAGES
 #define MIN_RUN_PAGES   16
+
 #endif
 #ifndef MAX_RUN_PAGES
 #define MAX_RUN_PAGES   512
 #endif
 #ifndef REVISIT_CHANCE
-#define REVISIT_CHANCE  4
+#define REVISIT_CHANCE  2
 #endif
 #ifndef HOT_SPOTS
 #define HOT_SPOTS       8
@@ -102,19 +103,18 @@ full_virtual_memory_test_helper(int thread_number) {
         else {
             PPTE pte = get_pte_from_va(arbitrary_va);
 
-            /* Age hint via CAS: a plain bitfield write is a full-qword RMW that
-             * could resurrect a stale VALID pte over a concurrent trim's
-             * TRANSITION stamp. CAS only succeeds if the PTE is still exactly
-             * the valid value we read; otherwise skip -- it's just a hint. */
-            ULONG64 old_val = *(volatile ULONG64*)pte;
+            // Ulong64 so we can actually pass it into interlocked
+            ULONG64 old_val = *(ULONG64*)pte;
 
+            // But we need the pte version so we can read it using the fields
             PTE snapshot;
             *(PULONG64)&snapshot = old_val;
 
+            // Only do this if it is valid and nobody has increased the age yet
             if (snapshot.hardware.valid == 1 && snapshot.hardware.age == 0) {
                 PTE updated = snapshot;
                 updated.hardware.age = 1;
-                InterlockedCompareExchange64((volatile LONG64*)pte,
+                InterlockedCompareExchange64(( LONG64*)pte,
                                              *(PLONG64)&updated,
                                              (LONG64)old_val);
             }
@@ -140,9 +140,10 @@ full_virtual_memory_test_helper(int thread_number) {
            thread_number, i);
 }
 
-
 VOID
 full_virtual_memory_test_helper_not_random(int thread_number) {
+    t_thread_number = thread_number;
+    t_ring_pos      = 0;
 
     THREAD_RNG_STATE thread_rng;
     thread_rng.state = __rdtsc();
@@ -174,7 +175,7 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
     BOOL  page_faulted;
     BOOL  resolved = TRUE;
 
-    ULONG64 runtime = (10 * (MB(1) / 1));
+    ULONG64 runtime = (100 * (MB(1) / 1));
 
     while (i < runtime) {
 
@@ -224,22 +225,33 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
         }
 
         if (page_faulted) {
-            handle_page_fault(arbitrary_va);
+            // workload: instead of handle_page_fault(va), when mid-run:
+            ULONG64 ahead = run_left;
+            ULONG64 prefetch = (ahead < MAX_PREFETCH) ? ahead : MAX_PREFETCH;
+            handle_page_fault_run(arbitrary_va, prefetch);
+            //handle_page_fault(arbitrary_va);
             continue;   /* retry the SAME va -- do not advance */
         }
 
-        /* Age hint, same CAS discipline as above. */
+        // If we didnt fault
         {
+            // Get the pte
             PPTE pte = get_pte_from_va(arbitrary_va);
+
+            // We need a ulong64 so we can actually pass those bits into the interlock
             ULONG64 old_val = *(volatile ULONG64*)pte;
 
+            // But we also need a real pte so we can read it using the fields
             PTE snapshot;
             *(PULONG64)&snapshot = old_val;
 
+            // Only do this if we actually didn't fault and nobody else set the age for us
             if (snapshot.hardware.valid == 1 && snapshot.hardware.age == 0) {
                 PTE updated = snapshot;
                 updated.hardware.age = 1;
-                InterlockedCompareExchange64((volatile LONG64*)pte,
+                // LK check return value to see if failed
+
+                InterlockedCompareExchange64(( LONG64*)pte,
                                              *(PLONG64)&updated,
                                              (LONG64)old_val);
             }
