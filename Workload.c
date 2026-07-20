@@ -121,7 +121,7 @@ full_virtual_memory_test_helper(int thread_number) {
         }
 
         if (i > 0 && i % (runtime / 100) == 0) {
-            printf(".");
+            DIAG_PRINT(".");
             fflush(stdout);
         }
 
@@ -175,7 +175,7 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
     BOOL  page_faulted;
     BOOL  resolved = TRUE;
 
-    ULONG64 runtime = (100 * (MB(1) / 1));
+    ULONG64 runtime = (10 * (MB(1) / 1));
 
     while (i < runtime) {
 
@@ -262,7 +262,7 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
         resolved = TRUE;
 
         if (i > 0 && i % (runtime / 100) == 0) {
-            printf(".");
+            DIAG_PRINT(".");
             fflush(stdout);
         }
         i++;

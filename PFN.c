@@ -40,8 +40,9 @@ setup_pfn_metadata(ULONG_PTR physical_page_count, PULONG_PTR physical_page_numbe
 
         p->frame_number         = frame;
         p->pte                  = NULL;
-        p->isOccupied           = 0;
         p->disc_index           = INVALID_DISC_SLOT;
+        p->isOccupied           = 0;
+        p->is_zero              = 1;
         p->isBeingWrittenToDisc = 0;
 
         InitializeCriticalSectionAndSpinCount(&p->lock, 4000);

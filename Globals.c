@@ -43,6 +43,10 @@ volatile LONG64 g_hard_faults_zero = 0;
 volatile LONG64 g_soft_faults      = 0;
 volatile LONG64 g_trim_unmaps      = 0;
 volatile LONG64 g_time_lock_wait = 0;
+volatile LONG64 g_frames_zeroed = 0;
+volatile LONG64 g_dz_from_zerolist = 0;
+volatile LONG64 g_dz_pristine = 0;
+volatile LONG64 g_dz_dirty = 0;
 
 /* ---- controller state (for dynamic trimmer) ---- */
 volatile LONG64 g_fault_stalls = 0;
@@ -63,3 +67,8 @@ HANDLE  PagesReadyForDiscEvent    = NULL;
 HANDLE  StartAgingEvent           = NULL;
 HANDLE  FinishedAgingEvent        = NULL;
 HANDLE  ShutdownEvent             = NULL;
+
+/* ---- zero thread worker ---- */
+LOCKED_LIST  pfn_zeroed_list;
+PVOID        zero_va_start   = NULL;
+HANDLE       NeedZeroingEvent = NULL;

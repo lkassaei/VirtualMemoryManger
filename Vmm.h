@@ -72,22 +72,57 @@
 #define STAGING_SLOTS_PER_THREAD  8
 #define STAGING_SLOTS  ((NUM_WORKER_THREADS + 1) * STAGING_SLOTS_PER_THREAD)
 
-#define NUM_WORKER_THREADS 6
+#define NUM_WORKER_THREADS 7 // Actually becomes 8 with main thread
 
 /* bounds so the controller can't run away */
 #define TRIM_TARGET_MIN   (NUMBER_OF_PHYSICAL_PAGES / 64)   /* ~4K  floor */
 #define TRIM_TARGET_MAX   (NUMBER_OF_PHYSICAL_PAGES / 8)    /* ~32K ceiling */
-#define TRIM_TARGET_STEP  1024                               /* small steps */
+#define TRIM_TARGET_STEP  1024
+
+/* small steps */
 
 /* hysteresis: stalls-per-interval thresholds */
 #define STALL_HIGH   100    /* above this: trimmer is behind, trim harder  */
 #define STALL_LOW    5      /* below this: trimmer is ahead, back off      */
 
-/* NOTE: the workload-only tunables (MIN_RUN_PAGES, MAX_RUN_PAGES,
- * REVISIT_CHANCE, HOT_SPOTS) are used only inside workload.c, so leave them
- * defined at the top of workload.c rather than polluting this shared header. */
+#define ZERO_BATCH        64      /* frames zeroed per background pass       */
+#define ZEROED_LIST_LOW   2048    /* refill trigger: zero more below this    */
+#define ZEROED_LIST_HIGH  4096    /* stop refilling above this               */
+
+/* ============================================================================
+ *  Diagnostics + safety switches.
+ *
+ *    VMM_DIAGNOSTICS  -- prints + counters. Real runtime cost. OFF for perf.
+ *    VMM_SAFETY       -- correctness guards / DebugBreaks.
+ * ========================================================================== */
+
+#ifndef VMM_DIAGNOSTICS
+#define VMM_DIAGNOSTICS 1        /* 1 = counters + prints on; 0 = silent/uncounted */
+#endif
+
+#ifndef VMM_SAFETY
+#define VMM_SAFETY 1             /* 1 = guards active; 0 = only once proven correct */
+#endif
 
 
+/* ---- diagnostics: compile to nothing when VMM_DIAGNOSTICS == 0 ---- */
+#if VMM_DIAGNOSTICS
+  #define DIAG_PRINT(...)   printf(__VA_ARGS__)
+  #define DIAG_COUNT(x)     InterlockedIncrement64(&(x))
+  #define DIAG_ADD(x, n)    InterlockedAdd64(&(x), (LONG64)(n))
+#else
+  #define DIAG_PRINT(...)   ((void)0)
+  #define DIAG_COUNT(x)     ((void)0)
+  #define DIAG_ADD(x, n)    ((void)0)
+#endif
+
+#if VMM_SAFETY
+  #define VMM_ASSERT(cond, ...)                                   \
+      do { if (!(cond)) { printf(__VA_ARGS__); DebugBreak(); } }  \
+      while (0)
+#else
+  #define VMM_ASSERT(cond, ...)  ((void)0)
+#endif
 /* ============================================================================
  *  2. TYPES
  * ========================================================================== */
@@ -156,9 +191,9 @@ typedef struct {
     PPTE pte;
     ULONG64 disc_index: MAX_DISC_PTE_BITS;
     ULONG64 isOccupied: 2; // 00 = free, 01 = active, 10 = modified, 11 = standby
+    ULONG64 is_zero: 1;
     ULONG64 isBeingWrittenToDisc: 1; // 0 = no 1 = yes
     ULONG64 lock_bit: 1;              // reserved: future home of the 1-bit lock
-    ULONG64 reserved: 20;
     CRITICAL_SECTION lock;            // delete once lock_bit works
 } pfn_metadata;
 
@@ -237,6 +272,10 @@ extern HANDLE  StartAgingEvent;
 extern HANDLE  FinishedAgingEvent;
 extern HANDLE  ShutdownEvent;
 
+extern LOCKED_LIST  pfn_zeroed_list;      /* frames confirmed zero, ready to hand out */
+extern PVOID        zero_va_start;        /* the zeroing thread's OWN mapping window   */
+extern HANDLE       NeedZeroingEvent;     /* wake the zeroing thread                   */
+
 extern __declspec(thread) int t_thread_number;
 extern __declspec(thread) int t_ring_pos;
 
@@ -245,6 +284,10 @@ extern volatile LONG64 g_hard_faults_zero;
 extern volatile LONG64 g_soft_faults;
 extern volatile LONG64 g_trim_unmaps;
 extern volatile LONG64 g_time_lock_wait;
+extern volatile LONG64 g_frames_zeroed;
+extern volatile LONG64 g_dz_from_zerolist;
+extern volatile LONG64 g_dz_pristine;
+extern volatile LONG64 g_dz_dirty;
 
 
 /* ---- controller state (for dynamic trimmer) ---- */
@@ -339,6 +382,7 @@ VOID  handle_page_fault(PVOID arbitrary_va);
 DWORD WINAPI AgeThreadWorker(LPVOID param);
 DWORD WINAPI TrimThreadWorker(LPVOID param);
 DWORD WINAPI DiscThreadWorker(LPVOID param);
+DWORD WINAPI ZeroThreadWorker(LPVOID param);
 
 /* --- rng.c --- */
 ULONG64 GetNextRandom(THREAD_RNG_STATE *rng);

@@ -28,7 +28,7 @@ handle_page_fault(PVOID arbitrary_va) {
     // QueryPerformanceCounter(&t0);
     EnterCriticalSection(my_pte_lock);          // this is what blocks under contention
     // QueryPerformanceCounter(&t1);
-    // InterlockedAdd64(&g_time_lock_wait, t1.QuadPart - t0.QuadPart);
+    //DIAG_ADD(g_time_lock_wait, t1.QuadPart - t0.QuadPart);
 
     if (pte->hardware.valid == 1) {                 /* another thread beat us */
         LeaveCriticalSection(my_pte_lock);
@@ -82,7 +82,7 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
         if (target_pfn == NULL) {
             SetEvent(LowPagesEvent);
-            InterlockedIncrement64(&g_fault_stalls);      /* controller signal */
+            DIAG_COUNT(g_fault_stalls);      /* controller signal */
             LeaveCriticalSection(my_pte_lock);
             while (pfn_free_list.count == 0 && pfn_standby_list.count == 0) {
                 WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* NOT INFINITE */
@@ -117,17 +117,93 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
      *  window -- publish directly at the real VA. ONE syscall, no staging.
      * ================================================================ */
     if (!is_on_disc || my_disc_slot == INVALID_DISC_SLOT) {
-        InterlockedIncrement64(&g_hard_faults_zero);
+        DIAG_COUNT(g_hard_faults_zero);
 
-        if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+        /* Prefer a pre-zeroed frame from the background thread: 1 syscall, no
+         * inline zeroing. We return the frame we already acquired and use the
+         * pre-zeroed one instead. */
+        PLIST_ENTRY ze = LockedRemoveHead(&pfn_zeroed_list);
+        if (ze != NULL) {
+            DIAG_COUNT(g_dz_from_zerolist);
+            /* hand back the frame we pulled at the top -- it may be dirty, that's
+             * fine, it goes back to the free list for the zeroing thread to grab. */
             lock_pfn(target_pfn);
             target_pfn->isOccupied = 0;
             target_pfn->disc_index = INVALID_DISC_SLOT;
             unlock_pfn(target_pfn);
             target_pfn->pte = NULL;
             LockedInsertTail(&pfn_free_list, &target_pfn->list);
-            LeaveCriticalSection(my_pte_lock);
-            return;
+
+            /* switch to the pre-zeroed frame (is_zero == 1, off all lists) */
+            target_pfn = GetPfnFromListEntry(ze);
+
+            if (pfn_zeroed_list.count < ZEROED_LIST_LOW) {
+                SetEvent(NeedZeroingEvent);
+            }
+
+            if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+                lock_pfn(target_pfn);
+                target_pfn->isOccupied = 0;
+                target_pfn->disc_index = INVALID_DISC_SLOT;
+                unlock_pfn(target_pfn);
+                target_pfn->pte = NULL;
+                LockedInsertTail(&pfn_free_list, &target_pfn->list);
+                LeaveCriticalSection(my_pte_lock);
+                return;
+            }
+            goto publish_pte;
+        }
+
+        /* Zeroed list empty -- fall back to inline handling of the frame we have. */
+        SetEvent(NeedZeroingEvent);   /* nudge: we're consuming faster than producing */
+
+        if (target_pfn->is_zero == 1) {
+            DIAG_COUNT(g_dz_pristine);
+            /* pristine frame: publish direct */
+            if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+                lock_pfn(target_pfn);
+                target_pfn->isOccupied = 0;
+                target_pfn->disc_index = INVALID_DISC_SLOT;
+                unlock_pfn(target_pfn);
+                target_pfn->pte = NULL;
+                LockedInsertTail(&pfn_free_list, &target_pfn->list);
+                LeaveCriticalSection(my_pte_lock);
+                return;
+            }
+        } else {
+            DIAG_COUNT(g_dz_dirty);
+            /* dirty frame: zero it through private staging before publish */
+            int   base = t_thread_number * STAGING_SLOTS_PER_THREAD;
+            int   slot = base + t_ring_pos;
+            t_ring_pos = (t_ring_pos + 1) % STAGING_SLOTS_PER_THREAD;
+            VMM_ASSERT(slot >= 0 && slot < STAGING_SLOTS,
+                       "BAD STAGING SLOT: slot=%d thread=%d\n", slot, t_thread_number);
+            PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
+
+            if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
+                DIAG_PRINT("Failed to map staging (zero). Error: %lu\n", GetLastError());
+                lock_pfn(target_pfn);
+                target_pfn->isOccupied = 0;
+                target_pfn->disc_index = INVALID_DISC_SLOT;
+                unlock_pfn(target_pfn);
+                target_pfn->pte = NULL;
+                LockedInsertTail(&pfn_free_list, &target_pfn->list);
+                LeaveCriticalSection(my_pte_lock);
+                return;
+            }
+            memset(staging_va, 0, PAGE_SIZE);
+            MapUserPhysicalPages(staging_va, 1, NULL);
+
+            if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
+                lock_pfn(target_pfn);
+                target_pfn->isOccupied = 0;
+                target_pfn->disc_index = INVALID_DISC_SLOT;
+                unlock_pfn(target_pfn);
+                target_pfn->pte = NULL;
+                LockedInsertTail(&pfn_free_list, &target_pfn->list);
+                LeaveCriticalSection(my_pte_lock);
+                return;
+            }
         }
         goto publish_pte;
     }
@@ -137,14 +213,15 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
      *  per-thread staging slot before publishing, so no other thread ever
      *  sees the real VA mapped with stale contents.
      * ================================================================ */
-    InterlockedIncrement64(&g_hard_faults_disc);
+    DIAG_COUNT(g_hard_faults_disc);
     {
         /* Per-thread staging slot: no lock, no interlocked -- the thread owns
          * its slice of the staging window, chosen by t_thread_number. */
         int   base = t_thread_number * STAGING_SLOTS_PER_THREAD;
         int   slot = base + t_ring_pos;
         t_ring_pos = (t_ring_pos + 1) % STAGING_SLOTS_PER_THREAD;
-        if (slot < 0 || slot >= STAGING_SLOTS) { DebugBreak(); }   /* thread id never set */
+        VMM_ASSERT(slot >= 0 && slot < STAGING_SLOTS,
+           "BAD STAGING SLOT: slot=%d thread=%d\n", slot, t_thread_number);
         PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
 
         /* 1. map the frame at the PRIVATE staging VA -- invisible to others */
@@ -191,16 +268,15 @@ publish_pte:
 
     lock_pfn(target_pfn);
     target_pfn->isOccupied = 1;
+    target_pfn->is_zero = 0;
     unlock_pfn(target_pfn);
     target_pfn->pte = pte;
 
     ULONG64 region_index = (pte - page_table) / PTE_REGION_SIZE;
-    if (target_pfn->list.Flink != NULL || target_pfn->list.Blink != NULL) {
-        printf("DOUBLE INSERT: pfn=%p Flink=%p Blink=%p occ=%d pte=%p\n",
-               target_pfn, target_pfn->list.Flink, target_pfn->list.Blink,
-               (int)target_pfn->isOccupied, target_pfn->pte);
-        DebugBreak();
-    }
+    VMM_ASSERT(target_pfn->list.Flink == NULL && target_pfn->list.Blink == NULL,
+           "DOUBLE INSERT: pfn=%p Flink=%p Blink=%p occ=%d pte=%p\n",
+           target_pfn, target_pfn->list.Flink, target_pfn->list.Blink,
+           (int)target_pfn->isOccupied, target_pfn->pte);
     InsertTailList(&pte_regions[region_index].active_age_lists[0], &target_pfn->list);
 
     LeaveCriticalSection(my_pte_lock);
@@ -209,7 +285,7 @@ publish_pte:
 
 static VOID
 handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
-    InterlockedIncrement64(&g_soft_faults);
+    DIAG_COUNT(g_soft_faults);
 
     ULONG64 frame_number = pte->transition.frame_number;
     pfn_metadata* target_pfn = find_pfn_from_frame_number(frame_number);

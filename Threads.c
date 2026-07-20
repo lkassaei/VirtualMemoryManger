@@ -133,9 +133,10 @@ AgeThreadWorker(LPVOID lpParam) {
                     ULONG64 walked = 0;
                     for (;;) {
                         if (cur == bin0_head) break;
-                        if (++walked > NUMBER_OF_PHYSICAL_PAGES) { DebugBreak(); break; }
-                        if (cur->Flink == NULL || cur->Blink == NULL || cur->Flink == cur) { DebugBreak(); break; }
-
+                        VMM_ASSERT(++walked <= NUMBER_OF_PHYSICAL_PAGES, "Out of bounds in Age Worker");
+                        VMM_ASSERT(cur->Flink != NULL && cur->Blink != NULL && cur->Flink != cur,
+           "corrupt bin0 link: cur=%p Flink=%p Blink=%p\n",
+           cur, cur->Flink, cur->Blink);
                         PLIST_ENTRY next    = cur->Flink;
                         BOOL        is_last = (cur == bin0_stop);   /* check BEFORE we move it */
 
@@ -431,7 +432,7 @@ get_unmap_candidates(int* batch_count, int batch_size) {
                     }
                     n = 0;
                 }
-                InterlockedAdd64(&g_trim_unmaps, n);
+                DIAG_ADD(g_trim_unmaps, n);
 
                 /* stamp PTEs to TRANSITION + publish to modified list */
                 for (int i = 0; i < n; i++) {
@@ -481,7 +482,7 @@ get_unmap_candidates(int* batch_count, int batch_size) {
                             InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
                         n = 0;
                     }
-                    InterlockedAdd64(&g_trim_unmaps, n);
+                    DIAG_ADD(g_trim_unmaps, n);
                     for (int i = 0; i < n; i++) {
                         pfn_metadata* c = candidates[i];
                         PPTE evict_pte = c->pte;
@@ -502,4 +503,164 @@ get_unmap_candidates(int* batch_count, int batch_size) {
             regions_checked++;
         }
     }
+}
+
+/* Pull the COLDEST viable standby frame for the zeroing pipeline. Repurposes
+ * it exactly like pull_from_standby_safely: stamps the old owner's PTE to disc
+ * state so that VA will hard-fault from disc if re-accessed. Returns a frame
+ * owned exclusively by the caller (off all lists), or NULL if none available.
+ *
+ * Called ONLY by the zeroing thread, which holds no region lock on entry --
+ * so unlike pull_from_standby_safely there is no my_pte_lock special case. */
+static pfn_metadata*
+pull_cold_standby_for_zeroing(void) {
+    int attempts = 0;
+
+    for (;;) {
+        if (++attempts > 32) return NULL;
+
+        pfn_metadata* cand = NULL;
+        PPTE owner_pte = NULL;
+
+        /* Scan from the TAIL -- coldest end, least likely to be soft-faulted. */
+        EnterCriticalSection(&pfn_standby_list.lock);
+        PLIST_ENTRY e = pfn_standby_list.head.Blink;         /* tail */
+        while (e != &pfn_standby_list.head) {
+            pfn_metadata* p = GetPfnFromListEntry(e);
+            if (p->isOccupied == 3 && p->isBeingWrittenToDisc == 0) {
+                cand = p;
+                owner_pte = p->pte;
+                break;
+            }
+            e = e->Blink;                                    /* walk toward head */
+        }
+        LeaveCriticalSection(&pfn_standby_list.lock);        /* drop before locking */
+
+        if (cand == NULL) return NULL;
+
+        /* No owner -- nothing to stamp, just claim it. */
+        if (owner_pte == NULL) {
+            EnterCriticalSection(&pfn_standby_list.lock);
+            if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+                cand->pte != NULL || cand->list.Flink == NULL) {
+                LeaveCriticalSection(&pfn_standby_list.lock);
+                continue;
+            }
+            RemoveEntryList(&cand->list);
+            cand->list.Flink = cand->list.Blink = NULL;
+            pfn_standby_list.count--;
+            LeaveCriticalSection(&pfn_standby_list.lock);
+
+            cand->disc_index = INVALID_DISC_SLOT;
+            cand->isOccupied = 0;        /* exclusively ours; going to zeroing */
+            return cand;
+        }
+
+        CRITICAL_SECTION* owner_lock = get_pte_lock_from_pte_pointer(owner_pte);
+
+        /* region -> page -> list. No my_pte_lock case: we hold nothing. */
+        if (!TryEnterCriticalSection(owner_lock)) continue;   /* contended; retry */
+
+        lock_pfn(cand);
+
+        if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
+            cand->pte != owner_pte) {
+            unlock_pfn(cand);
+            LeaveCriticalSection(owner_lock);
+            continue;
+        }
+
+        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {
+            unlock_pfn(cand);
+            LeaveCriticalSection(owner_lock);
+            continue;
+        }
+
+        set_to_disc_state(owner_pte, cand);   /* old owner now faults from disc */
+        cand->disc_index = INVALID_DISC_SLOT;
+        cand->isOccupied = 0;                  /* exclusively ours */
+        unlock_pfn(cand);
+
+        cand->pte = NULL;                      /* region-lock protected; we hold owner_lock */
+        LeaveCriticalSection(owner_lock);
+        return cand;
+    }
+}
+
+DWORD WINAPI
+ZeroThreadWorker(LPVOID lpParam) {
+    UNREFERENCED_PARAMETER(lpParam);
+    HANDLE waitEvents[2] = { NeedZeroingEvent, ShutdownEvent };
+
+    while (TRUE) {
+        DWORD w = WaitForMultipleObjects(2, waitEvents, FALSE, 50);   /* timeout so it self-checks */
+        if (w == WAIT_OBJECT_0 + 1) break;   /* shutdown */
+
+        /* Refill until we hit the high watermark or can't get frames. */
+        while (pfn_zeroed_list.count < ZEROED_LIST_HIGH) {
+            if (WaitForSingleObject(ShutdownEvent, 0) == WAIT_OBJECT_0) return 0;
+
+            /* ---- gather a batch of dirty frames to zero ---- */
+            pfn_metadata* batch[ZERO_BATCH];
+            ULONG_PTR     frame_nums[ZERO_BATCH];
+            PVOID         zero_vas[ZERO_BATCH];
+            int n = 0;
+
+            while (n < ZERO_BATCH) {
+                /* Prefer genuinely free dirty frames; else steal cold standby. */
+                pfn_metadata* f = NULL;
+                PLIST_ENTRY e = LockedRemoveHead(&pfn_free_list);
+                if (e != NULL) {
+                    f = GetPfnFromListEntry(e);
+                } else {
+                    f = pull_cold_standby_for_zeroing();   /* coldest standby; NULL if none */
+                }
+                if (f == NULL) break;   /* nothing to zero right now */
+
+                /* This frame is ours exclusively now (off all lists). */
+                batch[n]      = f;
+                frame_nums[n] = f->frame_number;
+                zero_vas[n]   = (char*)zero_va_start + ((ULONG_PTR)n * PAGE_SIZE);
+                n++;
+            }
+
+            if (n == 0) break;   /* couldn't get any -- give up this pass, wait for next wake */
+
+            /* ---- ONE scatter map for the whole batch ---- */
+            if (MapUserPhysicalPagesScatter(zero_vas, n, frame_nums) == FALSE) {
+                DIAG_PRINT("ZERO: batch map failed n=%d err=%lu\n", n, GetLastError());
+                /* return frames to free list; don't leak */
+                for (int i = 0; i < n; i++) {
+                    lock_pfn(batch[i]);
+                    batch[i]->isOccupied = 0;
+                    batch[i]->is_zero    = 0;
+                    unlock_pfn(batch[i]);
+                    batch[i]->pte = NULL;
+                    LockedInsertTail(&pfn_free_list, &batch[i]->list);
+                }
+                break;
+            }
+
+            /* ---- memset each (memory ops, not syscalls) ---- */
+            for (int i = 0; i < n; i++) {
+                memset(zero_vas[i], 0, PAGE_SIZE);
+            }
+
+            /* ---- ONE scatter unmap for the whole batch ---- */
+            MapUserPhysicalPagesScatter(zero_vas, n, NULL);
+
+            /* ---- publish to the zeroed list ---- */
+            for (int i = 0; i < n; i++) {
+                lock_pfn(batch[i]);
+                batch[i]->is_zero    = 1;
+                batch[i]->isOccupied = 0;   /* free-but-zeroed; on the zeroed list */
+                batch[i]->disc_index = INVALID_DISC_SLOT;
+                unlock_pfn(batch[i]);
+                batch[i]->pte = NULL;
+                LockedInsertTail(&pfn_zeroed_list, &batch[i]->list);
+            }
+            DIAG_ADD(g_frames_zeroed, n);
+        }
+    }
+    return 0;
 }

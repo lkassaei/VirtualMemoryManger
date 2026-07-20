@@ -17,3 +17,9 @@ add_executable(vmm
 )
 
 target_link_libraries(vmm advapi32)
+#
+#target_compile_definitions(vmm PRIVATE
+#        $<$<CONFIG:Debug>:VMM_DIAGNOSTICS=1>
+#        $<$<CONFIG:Release>:VMM_DIAGNOSTICS=0>
+#        VMM_SAFETY=1
+#)

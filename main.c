@@ -117,6 +117,7 @@ set_up_program(VOID) {
     InitializeLockedList(&pfn_modified_list);
     InitializeLockedList(&pfn_standby_list);
     InitializeLockedList(&disc_free_list);
+    InitializeLockedList(&pfn_zeroed_list);
 
     if (GetPrivilege() == FALSE) {
         printf("full_virtual_memory_test : could not get privilege\n");
@@ -190,6 +191,20 @@ set_up_program(VOID) {
                                       MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE);
 #endif
 
+    /* in set_up_program, next to the other VirtualAlloc2/VirtualAlloc reservations */
+#if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
+    zero_va_start = VirtualAlloc2(NULL, NULL, ZERO_BATCH * PAGE_SIZE,
+                                  MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE,
+                                  &temp_parameter, 1);
+#else
+    zero_va_start = VirtualAlloc(NULL, ZERO_BATCH * PAGE_SIZE,
+                                 MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE);
+#endif
+    if (zero_va_start == NULL) {
+        printf("CRITICAL: could not reserve zeroing window. Error: %lu\n", GetLastError());
+        return FALSE;
+    }
+
     if (temp_disc_va_start == NULL) {
         printf("CRITICAL: could not reserve disc I/O scratch. Error: %lu\n", GetLastError());
         return FALSE;
@@ -245,6 +260,8 @@ set_up_program(VOID) {
         return FALSE;
     }
 
+    SetEvent(NeedZeroingEvent);
+
     return TRUE;
 }
 
@@ -267,7 +284,7 @@ full_virtual_memory_test(VOID) {
         return;
     }
 
-    printf("max_frame=%llu  slots=%llu  table=%llu MB\n",
+    DIAG_PRINT("max_frame=%llu  slots=%llu  table=%llu MB\n",
            max_frame_number, max_frame_number + 1,
            ((max_frame_number + 1) * sizeof(pfn_metadata)) / MB(1));
 
@@ -280,13 +297,15 @@ full_virtual_memory_test(VOID) {
     ShutdownEvent             = CreateEvent(NULL, TRUE,  FALSE, NULL);
     StartAgingEvent           = CreateEvent(NULL, FALSE, FALSE, NULL);
     FinishedAgingEvent        = CreateEvent(NULL, FALSE, FALSE, NULL);
+    NeedZeroingEvent          = CreateEvent(NULL, FALSE, FALSE, NULL);   /* auto-reset */
 
     /* Workers at 0..NUM_WORKER_THREADS-1; background threads in the top slots. */
-    HANDLE threads[NUM_WORKER_THREADS + 3] = { NULL };
+    HANDLE threads[NUM_WORKER_THREADS + 4] = { NULL };
 
     threads[NUM_WORKER_THREADS + 0] = CreateThread(NULL, 0, TrimThreadWorker, NULL, 0, NULL);
     threads[NUM_WORKER_THREADS + 1] = CreateThread(NULL, 0, DiscThreadWorker, NULL, 0, NULL);
     threads[NUM_WORKER_THREADS + 2] = CreateThread(NULL, 0, AgeThreadWorker,  NULL, 0, NULL);
+    threads[NUM_WORKER_THREADS + 3] = CreateThread(NULL, 0, ZeroThreadWorker, NULL, 0, NULL);
 
     /* Main runs helper(0) inline, so created workers take VA-thread-numbers 1..N. */
     for (int i = 0; i < NUM_WORKER_THREADS; i++) {
@@ -300,9 +319,9 @@ full_virtual_memory_test(VOID) {
     /* Wait for all workers, then signal + join the background threads. */
     WaitForMultipleObjects(NUM_WORKER_THREADS, &threads[0], TRUE, INFINITE);
     SetEvent(ShutdownEvent);
-    WaitForMultipleObjects(3, &threads[NUM_WORKER_THREADS], TRUE, INFINITE);
+    WaitForMultipleObjects(4, &threads[NUM_WORKER_THREADS], TRUE, INFINITE);
 
-    for (int i = 0; i < NUM_WORKER_THREADS + 3; i++) {
+    for (int i = 0; i < NUM_WORKER_THREADS + 4; i++) {
         if (threads[i]) CloseHandle(threads[i]);
     }
     CloseHandle(LowPagesEvent);
@@ -311,6 +330,7 @@ full_virtual_memory_test(VOID) {
     CloseHandle(ShutdownEvent);
     CloseHandle(StartAgingEvent);
     CloseHandle(FinishedAgingEvent);
+    CloseHandle(NeedZeroingEvent);
 
     QueryPerformanceCounter(&end_time);
     elapsed_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / frequency.QuadPart;
@@ -320,10 +340,16 @@ full_virtual_memory_test(VOID) {
     printf("Total execution time: %.2f ms\n", elapsed_ms);
     printf("==============================================\n\n");
 
-    printf("faults: hard_disc=%lld hard_zero=%lld soft=%lld | trim_unmaps=%lld\n",
+    DIAG_PRINT("faults: hard_disc=%lld hard_zero=%lld soft=%lld | trim_unmaps=%lld\n",
        g_hard_faults_disc, g_hard_faults_zero, g_soft_faults, g_trim_unmaps);
 
-    // printf("phys=%u free=%lld standby=%lld modified=%lld active(est)=%lld\n",
+    DIAG_PRINT("zeroed: frames=%lld  zeroed_list_depth=%lld\n",
+           g_frames_zeroed, pfn_zeroed_list.count);
+
+    DIAG_PRINT("demand-zero: total=%lld | from_zerolist=%lld pristine=%lld dirty=%lld\n",
+           g_hard_faults_zero, g_dz_from_zerolist, g_dz_pristine, g_dz_dirty);
+
+    // DIAG_PRINT("phys=%u free=%lld standby=%lld modified=%lld active(est)=%lld\n",
     //    NUMBER_OF_PHYSICAL_PAGES,
     //    pfn_free_list.count, pfn_standby_list.count, pfn_modified_list.count,
     //    (LONG64)NUMBER_OF_PHYSICAL_PAGES - pfn_free_list.count
@@ -331,7 +357,7 @@ full_virtual_memory_test(VOID) {
     //
     // LARGE_INTEGER freq;
     // QueryPerformanceFrequency(&freq);
-    // printf("lock_wait total: %.1f ms\n",
+    // DIAG_PRINT("lock_wait total: %.1f ms\n",
     //        (double)g_time_lock_wait * 1000.0 / freq.QuadPart);
 
     /* ---- teardown ---- */
