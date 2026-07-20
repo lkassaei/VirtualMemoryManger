@@ -69,8 +69,13 @@
 #define PFN_LOCK_STRIPES 256
 #define PFN_LOCK(p) (&pfn_lock_stripes[(p)->frame_number & (PFN_LOCK_STRIPES - 1)])
 
-#define STAGING_SLOTS_PER_THREAD  8
-#define STAGING_SLOTS  ((NUM_WORKER_THREADS + 1) * STAGING_SLOTS_PER_THREAD)
+/* Per-worker-thread staging layout:
+ *   - RING_SLOTS_PER_THREAD : the deferred disc-read ring (batch-unmapped)
+ *   - one dedicated dirty-zero slot after the ring (immediate unmap)
+ * Total per thread = RING_SLOTS_PER_THREAD + 1. */
+#define RING_SLOTS_PER_THREAD     8
+#define STAGING_SLOTS_PER_THREAD  (RING_SLOTS_PER_THREAD + 1)     /* ring + dirty-zero slot */
+#define STAGING_SLOTS             ((NUM_WORKER_THREADS + 1) * STAGING_SLOTS_PER_THREAD)
 
 #define NUM_WORKER_THREADS 7 // Actually becomes 8 with main thread
 
@@ -341,6 +346,7 @@ static __forceinline VOID unlock_pfn(pfn_metadata *p) { LeaveCriticalSection(&p-
 /* --- lists.c --- */
 VOID        InitializeLockedList(PLOCKED_LIST list);
 VOID        LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry);
+VOID        LockedInsertTailBatch(PLOCKED_LIST list, PLIST_ENTRY* entries, int n);
 PLIST_ENTRY LockedRemoveHead(PLOCKED_LIST list);
 BOOL        LockedTryRemoveEntry(PLOCKED_LIST list, PLIST_ENTRY entry);
 
@@ -377,6 +383,7 @@ VOID    write_to_disc(pfn_metadata** candidates, ULONG64 batch_count);
 /* --- fault.c --- */
 ULONG64 GetNextRandom(THREAD_RNG_STATE* rng);
 VOID  handle_page_fault(PVOID arbitrary_va);
+VOID staging_flush_current_thread(void);
 
 /* --- threads.c --- */
 DWORD WINAPI AgeThreadWorker(LPVOID param);

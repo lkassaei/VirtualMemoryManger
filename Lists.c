@@ -87,6 +87,17 @@ LockedInsertTail(PLOCKED_LIST list, PLIST_ENTRY entry) {
     LeaveCriticalSection(&list->lock);
 }
 
+VOID
+LockedInsertTailBatch(PLOCKED_LIST list, PLIST_ENTRY* entries, int n) {
+    if (n <= 0) return;
+    EnterCriticalSection(&list->lock);
+    for (int i = 0; i < n; i++) {
+        InsertTailList(&list->head, entries[i]);
+    }
+    list->count += n;
+    LeaveCriticalSection(&list->lock);
+}
+
 PLIST_ENTRY
 LockedRemoveHead(PLOCKED_LIST list) {
     PLIST_ENTRY entry = NULL;

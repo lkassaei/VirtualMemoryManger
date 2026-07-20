@@ -12,10 +12,36 @@
  * selection needs no lock -- a thread only ever touches its own slice. */
 __declspec(thread) int t_thread_number = 0;
 __declspec(thread) int t_ring_pos      = 0;
+static __declspec(thread) PVOID  t_deferred[RING_SLOTS_PER_THREAD];
+static __declspec(thread) int    t_deferred_n    = 0;
 
 static VOID          handle_soft_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
 static VOID          handle_hard_fault(PPTE pte, PVOID va, CRITICAL_SECTION* my_pte_lock);
 static pfn_metadata* pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock);
+
+static void
+flush_staging_ring(void) {
+    if (t_deferred_n > 0) {
+        MapUserPhysicalPagesScatter(t_deferred, t_deferred_n, NULL);  /* ONE unmap for all */
+        t_deferred_n = 0;
+        t_ring_pos   = 0;
+    }
+}
+
+VOID staging_flush_current_thread(void) { flush_staging_ring(); }
+
+/* claim next slot; flush the whole ring first if full, so we NEVER map into a
+ * slot that still holds a deferred frame */
+static PVOID
+next_staging_slot(void) {
+    if (t_ring_pos >= STAGING_SLOTS_PER_THREAD) {
+        flush_staging_ring();
+    }
+    int slot = t_thread_number * STAGING_SLOTS_PER_THREAD + t_ring_pos;
+    VMM_ASSERT(slot >= 0 && slot < STAGING_SLOTS,
+               "BAD STAGING SLOT: slot=%d thread=%d\n", slot, t_thread_number);
+    return (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
+}
 
 VOID
 handle_page_fault(PVOID arbitrary_va) {
@@ -172,13 +198,13 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
             }
         } else {
             DIAG_COUNT(g_dz_dirty);
-            /* dirty frame: zero it through private staging before publish */
-            int   base = t_thread_number * STAGING_SLOTS_PER_THREAD;
-            int   slot = base + t_ring_pos;
-            t_ring_pos = (t_ring_pos + 1) % STAGING_SLOTS_PER_THREAD;
-            VMM_ASSERT(slot >= 0 && slot < STAGING_SLOTS,
-                       "BAD STAGING SLOT: slot=%d thread=%d\n", slot, t_thread_number);
-            PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
+            /* dirty frame: zero via the DEDICATED per-thread slot (the one after the
+             * ring). Immediate unmap. Never touches t_ring_pos / the deferred ring.
+             * Nearly-dead path (zeroing thread keeps g_dz_dirty ~= 0). */
+            int dz_slot = t_thread_number * STAGING_SLOTS_PER_THREAD + RING_SLOTS_PER_THREAD;
+            VMM_ASSERT(dz_slot >= 0 && dz_slot < STAGING_SLOTS,
+                       "BAD DZ SLOT: slot=%d thread=%d\n", dz_slot, t_thread_number);
+            PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)dz_slot * PAGE_SIZE);
 
             if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
                 DIAG_PRINT("Failed to map staging (zero). Error: %lu\n", GetLastError());
@@ -192,7 +218,7 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
                 return;
             }
             memset(staging_va, 0, PAGE_SIZE);
-            MapUserPhysicalPages(staging_va, 1, NULL);
+            MapUserPhysicalPages(staging_va, 1, NULL);   /* immediate -- dedicated slot */
 
             if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
                 lock_pfn(target_pfn);
@@ -213,20 +239,24 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
      *  per-thread staging slot before publishing, so no other thread ever
      *  sees the real VA mapped with stale contents.
      * ================================================================ */
-    DIAG_COUNT(g_hard_faults_disc);
+     DIAG_COUNT(g_hard_faults_disc);
     {
-        /* Per-thread staging slot: no lock, no interlocked -- the thread owns
-         * its slice of the staging window, chosen by t_thread_number. */
-        int   base = t_thread_number * STAGING_SLOTS_PER_THREAD;
-        int   slot = base + t_ring_pos;
-        t_ring_pos = (t_ring_pos + 1) % STAGING_SLOTS_PER_THREAD;
+        /* Flush the WHOLE ring before reusing any slot -- never map into a slot
+         * that still holds a deferred (mapped) frame. t_ring_pos counts up to
+         * RING_SLOTS_PER_THREAD then we batch-unmap all and reset. NO modulo. */
+        if (t_ring_pos >= RING_SLOTS_PER_THREAD) {
+            flush_staging_ring();
+        }
+
+        int   slot = t_thread_number * STAGING_SLOTS_PER_THREAD + t_ring_pos;
         VMM_ASSERT(slot >= 0 && slot < STAGING_SLOTS,
-           "BAD STAGING SLOT: slot=%d thread=%d\n", slot, t_thread_number);
+                   "BAD RING SLOT: slot=%d thread=%d ring_pos=%d\n",
+                   slot, t_thread_number, t_ring_pos);
         PVOID staging_va = (char*)staging_va_start + ((ULONG_PTR)slot * PAGE_SIZE);
 
-        /* 1. map the frame at the PRIVATE staging VA -- invisible to others */
+        /* 1. map frame into MY private staging slot */
         if (MapUserPhysicalPages(staging_va, 1, &target_pfn->frame_number) == FALSE) {
-            printf("Failed to map staging. VA %p Error: %lu\n", va_aligned, GetLastError());
+            DIAG_PRINT("Failed to map staging. VA %p Error: %lu\n", va_aligned, GetLastError());
             lock_pfn(target_pfn);
             target_pfn->isOccupied = 0;
             target_pfn->disc_index = INVALID_DISC_SLOT;
@@ -237,16 +267,20 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
             return;
         }
 
-        /* 2. fill from disc while private, then free the disc slot */
+        /* record as deferred AFTER a confirmed map, so t_deferred only holds
+         * genuinely-mapped VAs (batch unmap never touches an unmapped VA) */
+        t_deferred[t_ring_pos] = staging_va;
+        t_ring_pos++;
+        t_deferred_n = t_ring_pos;
+
+        /* 2. fill from disc, free the disc slot */
         memcpy(staging_va, (char*)disc + (my_disc_slot * PAGE_SIZE), PAGE_SIZE);
         EnterCriticalSection(&disc_lock);
         disc_metadata[my_disc_slot].isOccupied = FALSE;
         LeaveCriticalSection(&disc_lock);
         LockedInsertTail(&disc_free_list, &disc_metadata[my_disc_slot].list);
 
-        /* 3. unmap staging BEFORE publish -- the frame must not be double-mapped
-         *    (staging + real) once it becomes trimmable. Cannot be deferred. */
-        MapUserPhysicalPages(staging_va, 1, NULL);
+        /* 3. NO unmap here -- deferred to flush_staging_ring(). */
 
         /* 4. publish at the real VA */
         if (MapUserPhysicalPages(va_aligned, 1, &target_pfn->frame_number) == FALSE) {
@@ -371,30 +405,34 @@ static pfn_metadata*
 pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
     ULONG64 attempts = 0;
     for (;;) {
-        if (++attempts > 16) return NULL;
+        if (++attempts > 32) return NULL;
 
+        /* Grab the head entry under the lock and GET OUT. No walking, no
+         * skip-scan -- just take the first entry's identity and release.
+         * Everything else happens outside the standby lock. */
         pfn_metadata* cand = NULL;
         PPTE owner_pte = NULL;
-        int  skip = (int)(attempts - 1);
 
         EnterCriticalSection(&pfn_standby_list.lock);
         PLIST_ENTRY e = pfn_standby_list.head.Flink;
-        while (e != &pfn_standby_list.head) {
-            pfn_metadata* p = GetPfnFromListEntry(e);
-            if (p->isOccupied == 3 && p->isBeingWrittenToDisc == 0) {
-                if (skip > 0) { skip--; }
-                else { cand = p; owner_pte = p->pte; break; }
-            }
-            e = e->Flink;
+        if (e != &pfn_standby_list.head) {
+            cand = GetPfnFromListEntry(e);
+            owner_pte = cand->pte;                 /* snapshot under lock */
         }
-        LeaveCriticalSection(&pfn_standby_list.lock);
+        LeaveCriticalSection(&pfn_standby_list.lock);   /* OUT immediately */
 
-        if (cand == NULL) return NULL;
+        if (cand == NULL) return NULL;   /* standby empty */
 
-        if (owner_pte == NULL) {                        /* nothing to stamp */
+        /* viability check OUTSIDE the standby lock */
+        if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0) {
+            continue;   /* not viable; retry grabs a different head next time */
+        }
+
+        if (owner_pte == NULL) {
+            /* no owner -- claim under the lock, re-verify */
             EnterCriticalSection(&pfn_standby_list.lock);
             if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
-                cand->pte != NULL) {
+                cand->pte != NULL || cand->list.Flink == NULL) {
                 LeaveCriticalSection(&pfn_standby_list.lock);
                 continue;
             }
@@ -409,13 +447,11 @@ pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
         }
 
         CRITICAL_SECTION* owner_lock = get_pte_lock_from_pte_pointer(owner_pte);
-
         if (owner_lock != my_pte_lock) {
-            if (!TryEnterCriticalSection(owner_lock)) continue;   /* skip contended */
+            if (!TryEnterCriticalSection(owner_lock)) continue;
         }
 
-        lock_pfn(cand);                                 /* region -> page */
-
+        lock_pfn(cand);
         if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
             cand->pte != owner_pte) {
             unlock_pfn(cand);
@@ -423,18 +459,18 @@ pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
             continue;
         }
 
-        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {   /* page -> list */
+        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {
             unlock_pfn(cand);
             if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
             continue;
         }
 
-        set_to_disc_state(owner_pte, cand);             /* reads disc_index BEFORE clear */
+        set_to_disc_state(owner_pte, cand);
         cand->disc_index = INVALID_DISC_SLOT;
         cand->isOccupied = 1;
         unlock_pfn(cand);
 
-        cand->pte = NULL;                               /* region-lock protected */
+        cand->pte = NULL;
         if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
         return cand;
     }
