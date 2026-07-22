@@ -226,10 +226,7 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
 
         if (page_faulted) {
             // workload: instead of handle_page_fault(va), when mid-run:
-            ULONG64 ahead = run_left;
-            ULONG64 prefetch = (ahead < MAX_PREFETCH) ? ahead : MAX_PREFETCH;
-            handle_page_fault_run(arbitrary_va, prefetch);
-            //handle_page_fault(arbitrary_va);
+            handle_page_fault(arbitrary_va);
             continue;   /* retry the SAME va -- do not advance */
         }
 

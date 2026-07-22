@@ -37,6 +37,7 @@ PULONG_PTR physical_page_numbers = NULL;
 LOCKED_LIST  pfn_free_list;
 LOCKED_LIST  pfn_modified_list;
 LOCKED_LIST  pfn_standby_list;
+LOCKED_LIST pfn_standby_shards[STANDBY_SHARDS];
 
 volatile LONG64 g_hard_faults_disc = 0;
 volatile LONG64 g_hard_faults_zero = 0;

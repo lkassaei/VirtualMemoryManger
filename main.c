@@ -115,9 +115,11 @@ BOOL
 set_up_program(VOID) {
     InitializeLockedList(&pfn_free_list);
     InitializeLockedList(&pfn_modified_list);
-    InitializeLockedList(&pfn_standby_list);
     InitializeLockedList(&disc_free_list);
     InitializeLockedList(&pfn_zeroed_list);
+    for (int i = 0; i < STANDBY_SHARDS; i++) {
+        InitializeLockedList(&pfn_standby_shards[i]);   /* whatever your init is */
+    }
 
     if (GetPrivilege() == FALSE) {
         printf("full_virtual_memory_test : could not get privilege\n");
@@ -161,6 +163,7 @@ set_up_program(VOID) {
     }
 
     setup_pfn_metadata(physical_page_count, physical_page_numbers);
+
 
     /* ---- disc ---- */
     disc_page_count = NUM_DISC_PAGES;

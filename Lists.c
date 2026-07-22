@@ -92,6 +92,16 @@ LockedInsertTailBatch(PLOCKED_LIST list, PLIST_ENTRY* entries, int n) {
     if (n <= 0) return;
     EnterCriticalSection(&list->lock);
     for (int i = 0; i < n; i++) {
+        if (entries[i]->Flink != NULL || entries[i]->Blink != NULL) {
+            pfn_metadata* bad = GetPfnFromListEntry(entries[i]);
+            /* identify the frame and its state */
+            DIAG_PRINT("BATCH INSERT LINKED: pfn=%p frame=%llu occ=%d pte=%p Flink=%p Blink=%p\n",
+                       bad, bad->frame_number, (int)bad->isOccupied, bad->pte,
+                       entries[i]->Flink, entries[i]->Blink);
+            DebugBreak();
+        }
+        VMM_ASSERT(entries[i]->Flink == NULL && entries[i]->Blink == NULL,
+                   "batch insert: entry %d already linked Flink=%p\n", i, entries[i]->Flink);
         InsertTailList(&list->head, entries[i]);
     }
     list->count += n;

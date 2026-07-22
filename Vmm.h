@@ -94,6 +94,8 @@
 #define ZEROED_LIST_LOW   2048    /* refill trigger: zero more below this    */
 #define ZEROED_LIST_HIGH  4096    /* stop refilling above this               */
 
+#define STANDBY_SHARDS 8                      /* power of two -> cheap masking */
+
 /* ============================================================================
  *  Diagnostics + safety switches.
  *
@@ -123,8 +125,7 @@
 
 #if VMM_SAFETY
   #define VMM_ASSERT(cond, ...)                                   \
-      do { if (!(cond)) { printf(__VA_ARGS__); DebugBreak(); } }  \
-      while (0)
+      if (!(cond)) { printf(__VA_ARGS__); DebugBreak(); }
 #else
   #define VMM_ASSERT(cond, ...)  ((void)0)
 #endif
@@ -259,7 +260,9 @@ extern PULONG_PTR physical_page_numbers;
 /* ---- physical page lists ---- */
 extern LOCKED_LIST   pfn_free_list;
 extern LOCKED_LIST   pfn_modified_list;
-extern LOCKED_LIST   pfn_standby_list;
+//extern LOCKED_LIST   pfn_standby_list;
+extern LOCKED_LIST   pfn_standby_shards[STANDBY_SHARDS];
+
 
 /* ---- disc ---- */
 extern PVOID          disc;               /* the buffer (standardized name) */
@@ -313,7 +316,17 @@ GetPfnFromListEntry(PLIST_ENTRY entry) {
 
 static __forceinline VOID lock_pfn(pfn_metadata *p)   { EnterCriticalSection(&p->lock); }
 static __forceinline VOID unlock_pfn(pfn_metadata *p) { LeaveCriticalSection(&p->lock); }
+static __forceinline int standby_shard_of(ULONG64 frame_number) {
+    return (int)(frame_number & (STANDBY_SHARDS - 1));
+}
 
+static __forceinline ULONG64 standby_total_count(void) {
+    ULONG64 total = 0;
+    for (int i = 0; i < STANDBY_SHARDS; i++) {
+        total += pfn_standby_shards[i].count;
+    }
+    return total;
+}
 /* When you migrate to the 1-bit lock, ONLY these two bodies change:
  *
  *   #define PFN_LOCK_BIT 43   // == bit position of lock_bit in the qword

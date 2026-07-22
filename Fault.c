@@ -104,13 +104,16 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
             target_pfn = GetPfnFromListEntry(free_entry);
         } else {
             target_pfn = pull_from_standby_safely(my_pte_lock);
+            if (target_pfn != NULL) {
+                unlock_pfn(target_pfn);   /* returned page-locked; release after handoff */
+            }
         }
 
         if (target_pfn == NULL) {
             SetEvent(LowPagesEvent);
             DIAG_COUNT(g_fault_stalls);      /* controller signal */
             LeaveCriticalSection(my_pte_lock);
-            while (pfn_free_list.count == 0 && pfn_standby_list.count == 0) {
+            while (pfn_free_list.count == 0 && standby_total_count() == 0) {
                 WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* NOT INFINITE */
             }
             EnterCriticalSection(my_pte_lock);
@@ -347,17 +350,17 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
          * reclaims the slot there. Do NOT free it here -- double free. */
         target_pfn->isBeingWrittenToDisc = 0;
     }
-    else if (target_pfn->isOccupied == 3) {
-        if (LockedTryRemoveEntry(&pfn_standby_list, &target_pfn->list)) {
-            slot_to_free = target_pfn->disc_index;
-            target_pfn->disc_index = INVALID_DISC_SLOT;
-        }
-    }
-    else if (target_pfn->isOccupied == 2) {
+
+    target_pfn->isBeingWrittenToDisc = 0;      /* unconditional poach claim (idempotent) */
+
+    if (target_pfn->isOccupied == 2) {
         LockedTryRemoveEntry(&pfn_modified_list, &target_pfn->list);
+    } else if (target_pfn->isOccupied == 3) {
+        int sh = standby_shard_of(target_pfn->frame_number);
+        LockedTryRemoveEntry(&pfn_standby_shards[sh], &target_pfn->list);
     }
 
-    target_pfn->isOccupied = 1;                        /* signal disc Phase 1 re-checks */
+    target_pfn->isOccupied = 1;
     unlock_pfn(target_pfn);
 
     if (slot_to_free != INVALID_DISC_SLOT) {
@@ -400,57 +403,77 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     LeaveCriticalSection(my_pte_lock);
 }
 
-
+/* Returns a frame exclusively the caller's, PAGE-LOCKED (lock_pfn held) so no
+ * soft fault can touch it during handoff. Caller must unlock_pfn(). NULL if no
+ * viable standby frame right now.
+ *
+ * Lock hierarchy region -> page -> list is preserved. Uses TWO standby
+ * acquisitions by design:
+ *   - acquisition 1: peek the head candidate, snapshot its owner, release.
+ *   - then take region -> page locks (impossible while holding the list lock).
+ *   - acquisition 2: remove from the list, now that the higher locks are held.
+ *
+ * EVERY path that holds pfn_standby_list.lock releases it before continue/return
+ * and before taking any other lock. That is the invariant; the deadlock came
+ * from a path that skipped the release. */
 static pfn_metadata*
 pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
     ULONG64 attempts = 0;
+    int start = t_thread_number & (STANDBY_SHARDS - 1);   /* spread threads across shards */
+
     for (;;) {
         if (++attempts > 32) return NULL;
 
-        /* Grab the head entry under the lock and GET OUT. No walking, no
-         * skip-scan -- just take the first entry's identity and release.
-         * Everything else happens outside the standby lock. */
+        /* try each shard once, starting at our own, before giving up */
         pfn_metadata* cand = NULL;
         PPTE owner_pte = NULL;
+        LOCKED_LIST* shard = NULL;
 
-        EnterCriticalSection(&pfn_standby_list.lock);
-        PLIST_ENTRY e = pfn_standby_list.head.Flink;
-        if (e != &pfn_standby_list.head) {
-            cand = GetPfnFromListEntry(e);
-            owner_pte = cand->pte;                 /* snapshot under lock */
+        for (int k = 0; k < STANDBY_SHARDS; k++) {
+            LOCKED_LIST* s = &pfn_standby_shards[(start + k) & (STANDBY_SHARDS - 1)];
+
+            /* lock-free peek: skip empty shards without acquiring */
+            if (s->head.Flink == &s->head) continue;
+
+            EnterCriticalSection(&s->lock);
+            PLIST_ENTRY e = s->head.Flink;
+            if (e == &s->head) { LeaveCriticalSection(&s->lock); continue; }
+            cand      = GetPfnFromListEntry(e);
+            owner_pte = cand->pte;
+            BOOL viable = (cand->isOccupied == 3 && cand->isBeingWrittenToDisc == 0);
+            LeaveCriticalSection(&s->lock);
+
+            if (!viable) { cand = NULL; continue; }
+            shard = s;
+            break;   /* found a candidate in this shard */
         }
-        LeaveCriticalSection(&pfn_standby_list.lock);   /* OUT immediately */
 
-        if (cand == NULL) return NULL;   /* standby empty */
+        if (cand == NULL) return NULL;   /* all shards empty/unviable this pass */
 
-        /* viability check OUTSIDE the standby lock */
-        if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0) {
-            continue;   /* not viable; retry grabs a different head next time */
-        }
-
+        /* ---- NO-OWNER PATH ---- */
         if (owner_pte == NULL) {
-            /* no owner -- claim under the lock, re-verify */
-            EnterCriticalSection(&pfn_standby_list.lock);
+            EnterCriticalSection(&shard->lock);
             if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
                 cand->pte != NULL || cand->list.Flink == NULL) {
-                LeaveCriticalSection(&pfn_standby_list.lock);
+                LeaveCriticalSection(&shard->lock);
                 continue;
             }
             RemoveEntryList(&cand->list);
             cand->list.Flink = cand->list.Blink = NULL;
-            pfn_standby_list.count--;
-            LeaveCriticalSection(&pfn_standby_list.lock);
+            shard->count--;
+            LeaveCriticalSection(&shard->lock);
 
+            lock_pfn(cand);
             cand->disc_index = INVALID_DISC_SLOT;
             cand->isOccupied = 1;
             return cand;
         }
 
+        /* ---- OWNER PATH ---- */
         CRITICAL_SECTION* owner_lock = get_pte_lock_from_pte_pointer(owner_pte);
         if (owner_lock != my_pte_lock) {
             if (!TryEnterCriticalSection(owner_lock)) continue;
         }
-
         lock_pfn(cand);
         if (cand->isOccupied != 3 || cand->isBeingWrittenToDisc != 0 ||
             cand->pte != owner_pte) {
@@ -458,122 +481,16 @@ pull_from_standby_safely(CRITICAL_SECTION* my_pte_lock) {
             if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
             continue;
         }
-
-        if (!LockedTryRemoveEntry(&pfn_standby_list, &cand->list)) {
+        if (!LockedTryRemoveEntry(shard, &cand->list)) {   /* remove from the SAME shard */
             unlock_pfn(cand);
             if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
             continue;
         }
-
         set_to_disc_state(owner_pte, cand);
         cand->disc_index = INVALID_DISC_SLOT;
         cand->isOccupied = 1;
-        unlock_pfn(cand);
-
         cand->pte = NULL;
         if (owner_lock != my_pte_lock) LeaveCriticalSection(owner_lock);
         return cand;
     }
-}
-
-
-
-VOID
-handle_page_fault_run(PVOID base_va, ULONG64 run_ahead) {
-    PPTE base_pte = get_pte_from_va(base_va);
-    CRITICAL_SECTION* my_pte_lock = get_pte_lock_for_va(base_va);
-
-    /* Clamp the batch so it never crosses this PTE's region boundary
-     * (crossing would need a second region lock -> ABBA risk). */
-    ULONG64 pte_index      = (ULONG64)(base_pte - page_table);
-    ULONG64 region_end     = ((pte_index / PTE_REGION_SIZE) + 1) * PTE_REGION_SIZE;
-    ULONG64 room_in_region = region_end - pte_index;               /* PTEs left in region */
-    ULONG64 want = run_ahead + 1;                                  /* this page + prefetch */
-    if (want > room_in_region) want = room_in_region;
-    if (want > MAX_PREFETCH + 1) want = MAX_PREFETCH + 1;
-
-    EnterCriticalSection(my_pte_lock);
-
-    /* Collect the contiguous run of pages that are FAULTS OF THE SAME KIND
-     * starting at base. Stop at the first page that's valid / transition /
-     * different-state -- the batch only covers uniform demand-zero (or uniform
-     * disc, but disc needs per-page disc_index, so start with demand-zero). */
-    PPTE   pte_batch[MAX_PREFETCH + 1];
-    PVOID  va_batch[MAX_PREFETCH + 1];
-    int    m = 0;
-
-    for (ULONG64 i = 0; i < want; i++) {
-        PPTE p = base_pte + i;
-        if (p->hardware.valid == 1) break;          /* already mapped: stop the run */
-        if (p->transition.transition == 1) break;   /* soft-fault case: handle singly */
-        /* demand-zero only for the batch fast path: */
-        if (p->disc.disc == 1) break;               /* on disc: needs per-page read, stop */
-
-        pte_batch[m] = p;
-        va_batch[m]  = (PVOID)((ULONG_PTR)base_va + i * PAGE_SIZE);
-        m++;
-    }
-
-    if (m == 0) {
-        /* base page wasn't a demand-zero fault -- fall back to the single path,
-         * still under the lock we hold. */
-        LeaveCriticalSection(my_pte_lock);
-        handle_page_fault(base_va);   /* re-dispatches; it re-takes the lock */
-        return;
-    }
-
-    /* Acquire up to m frames. Take what we can; don't stall for all m. */
-    pfn_metadata* frames[MAX_PREFETCH + 1];
-    int got = 0;
-    for (; got < m; got++) {
-        PLIST_ENTRY e = LockedRemoveHead(&pfn_free_list);
-        if (e == NULL) {
-            pfn_metadata* p = pull_from_standby_safely(my_pte_lock);
-            if (p == NULL) break;                   /* out of frames; publish what we have */
-            frames[got] = p;
-        } else {
-            frames[got] = GetPfnFromListEntry(e);
-        }
-    }
-
-    if (got == 0) {
-        /* couldn't get even one frame -- fall back to single path which has the
-         * proper wait-for-page loop. */
-        LeaveCriticalSection(my_pte_lock);
-        handle_page_fault(base_va);
-        return;
-    }
-
-    /* Demand-zero: frames are already zero (fresh AWE) -- no fill needed.
-     * Publish all `got` frames at their real VAs in ONE scatter. */
-    ULONG_PTR frame_numbers[MAX_PREFETCH + 1];
-    for (int i = 0; i < got; i++) frame_numbers[i] = frames[i]->frame_number;
-
-    if (MapUserPhysicalPagesScatter(va_batch, got, frame_numbers) == FALSE) {
-        /* scatter failed: return frames, fall back */
-        for (int i = 0; i < got; i++) {
-            frames[i]->isOccupied = 0;
-            LockedInsertTail(&pfn_free_list, &frames[i]->list);
-        }
-        LeaveCriticalSection(my_pte_lock);
-        handle_page_fault(base_va);
-        return;
-    }
-
-    /* Stamp PTEs valid + publish pfns to the age list. */
-    ULONG64 region_index = pte_index / PTE_REGION_SIZE;
-    for (int i = 0; i < got; i++) {
-        set_pte_valid(pte_batch[i], frames[i]->frame_number);   /* atomic, age=0 */
-
-        lock_pfn(frames[i]);
-        frames[i]->isOccupied = 1;
-        unlock_pfn(frames[i]);
-        frames[i]->pte = pte_batch[i];
-
-        InsertTailList(&pte_regions[region_index].active_age_lists[0], &frames[i]->list);
-    }
-
-    if (pfn_free_list.count < LOWEST_PAGES) SetEvent(LowPagesEvent);
-
-    LeaveCriticalSection(my_pte_lock);
 }
