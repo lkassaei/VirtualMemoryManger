@@ -43,15 +43,17 @@
 
 // Sizing constants
 #define PAGE_SIZE 4096
-#define MB(x) ((x) * 1024 * 1024)
-#define KB(x) ((x) * 1024)
+
+#define MB(x) (((ULONG64)(x)) * 1024 * 1024)
+#define KB(x) ((ULONG64)(x) * 1024)
+#define GB(x) (MB(x) * 1024)
 
 #define MAX_AGE_BITS 8
 
-#define NUMBER_OF_PHYSICAL_PAGES (1 * (MB(1024) / PAGE_SIZE))
+#define NUMBER_OF_PHYSICAL_PAGES (1 * (GB(1) / PAGE_SIZE))
 //#define NUMBER_OF_PHYSICAL_PAGES 4
 #define NUM_PTEs (VIRTUAL_ADDRESS_SIZE / PAGE_SIZE)
-#define NUM_DISC_PAGES (5 * NUMBER_OF_PHYSICAL_PAGES)
+#define NUM_DISC_PAGES (1 * NUMBER_OF_PHYSICAL_PAGES)
 #define MAX_DISC_PTE_BITS 40
 #define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 #define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
@@ -95,6 +97,19 @@
 #define ZEROED_LIST_HIGH  4096    /* stop refilling above this               */
 
 #define STANDBY_SHARDS 8                      /* power of two -> cheap masking */
+
+/* ---- workload tuning knobs ----
+ * WORKING_SET_DIVISOR: cold jumps are confined to
+ *   total_pages / WORKING_SET_DIVISOR. 1 = the old full-span behavior
+ *   (max pressure, everything goes to disc). Larger = tighter working set,
+ *   more pages survive on standby, more soft faults. Try 2 or 4 first.
+ * REVISIT_CHANCE: 1-in-N run starts is a revisit. Lower N = more revisits.
+ * RECENT_BIAS: revisits pick from the newest RECENT_BIAS ring entries this
+ *   often (1-in-N), otherwise anywhere in the ring. Recency matters because
+ *   a page trimmed 2ms ago is on standby; one trimmed 2s ago is on disc. */
+#define WORKING_SET_DIVISOR 1 // Make bigger for max performance
+#define REVISIT_CHANCE      2      /* was 4 */
+#define RECENT_BIAS         1    /* all revisits target the newest spots */
 
 /* ============================================================================
  *  Diagnostics + safety switches.

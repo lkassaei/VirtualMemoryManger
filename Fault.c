@@ -398,6 +398,9 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
                (int)target_pfn->isOccupied, target_pfn->pte);
         DebugBreak();
     }
+    VMM_ASSERT(target_pfn->list.Flink == NULL && target_pfn->list.Blink == NULL,
+           "soft age-insert still-linked: pfn=%p Flink=%p occ=%d\n",
+           target_pfn, target_pfn->list.Flink, (int)target_pfn->isOccupied);
     InsertTailList(&pte_regions[region_index].active_age_lists[0], &target_pfn->list);
 
     LeaveCriticalSection(my_pte_lock);

@@ -140,6 +140,14 @@ full_virtual_memory_test_helper(int thread_number) {
            thread_number, i);
 }
 
+/* One remembered hot spot: base AND length, so a revisit re-touches the
+ * SAME pages. Revisiting a base with a fresh random length mostly touches
+ * new pages, which fault hard -- that was the old behavior. */
+typedef struct _HOT_SPOT {
+    ULONG64 base;
+    ULONG64 len;
+} HOT_SPOT;
+
 VOID
 full_virtual_memory_test_helper_not_random(int thread_number) {
     t_thread_number = thread_number;
@@ -160,13 +168,26 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
     ULONG64 total_pages = virtual_address_size_in_unsigned_chunks
                           / (PAGE_SIZE / sizeof(ULONG_PTR));
 
-    /* Ring of recently-visited bases. Revisiting these is what creates the
-     * hot/cold split that aging is supposed to detect. */
-    ULONG64 hot[HOT_SPOTS] = { 0 };
-    int     hot_next  = 0;
-    int     hot_count = 0;
+    /* Confine cold jumps to a bounded span. This is the single biggest lever
+     * on the soft/hard split: with the full span the working set is many times
+     * physical, so every trimmed page is gone to disc before you return to it.
+     * A tighter span means trimmed pages are still on standby when revisited. */
+    ULONG64 cold_span = total_pages / WORKING_SET_DIVISOR;
+    if (cold_span == 0) cold_span = total_pages;
 
-    ULONG64 base_page = GetNextRandom(&thread_rng) % total_pages;
+    /* Give each thread its own slice of the span so the 8 workers aren't all
+     * hammering the same pages (which would serialize on region locks) but
+     * still overlap enough to share standby pressure. */
+    ULONG64 slice     = cold_span / (NUM_WORKER_THREADS + 1);
+    ULONG64 slice_lo  = (ULONG64)thread_number * slice;
+    if (slice == 0) { slice = cold_span; slice_lo = 0; }
+
+    HOT_SPOT hot[HOT_SPOTS];
+    for (int h = 0; h < HOT_SPOTS; h++) { hot[h].base = 0; hot[h].len = 0; }
+    int hot_next  = 0;
+    int hot_count = 0;
+
+    ULONG64 base_page = slice_lo + (GetNextRandom(&thread_rng) % slice);
     ULONG64 run_left  = 0;
     ULONG64 cur_page  = base_page;
 
@@ -184,26 +205,47 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
                 ULONG64 r = GetNextRandom(&thread_rng);
 
                 if (hot_count > 0 && (r % REVISIT_CHANCE) == 0) {
-                    /* Jump back to a recent base -- these pages should still be
-                     * young; aging should keep them out of the high bins. */
-                    base_page = hot[GetNextRandom(&thread_rng) % hot_count];
+                    /* REVISIT: re-touch the SAME pages we touched before, so
+                     * they're either still valid (no fault) or on
+                     * modified/standby (SOFT fault) -- not fresh pages that
+                     * would fault hard. */
+                    int pick;
+                    if ((GetNextRandom(&thread_rng) % RECENT_BIAS) == 0) {
+                        /* newest few spots: most likely still on standby */
+                        int recent = (hot_count < 4) ? hot_count : 4;
+                        int back   = 1 + (int)(GetNextRandom(&thread_rng) % recent);
+                        pick = (hot_next - back + HOT_SPOTS) % HOT_SPOTS;
+                    } else {
+                        pick = (int)(GetNextRandom(&thread_rng) % hot_count);
+                    }
+                    base_page = hot[pick].base;
+                    run_left  = hot[pick].len;      /* same span as before */
+
+                    /* Re-stamp this spot as most-recent so repeated revisits
+                     * keep a small set genuinely hot. */
+                    hot[hot_next].base = base_page;
+                    hot[hot_next].len  = run_left;
+                    hot_next = (hot_next + 1) % HOT_SPOTS;
+                    if (hot_count < HOT_SPOTS) hot_count++;
+
                 } else {
-                    /* Cold jump: somewhere new entirely. */
-                    base_page = GetNextRandom(&thread_rng) % total_pages;
-                    hot[hot_next] = base_page;
+                    /* COLD JUMP: new location, but inside this thread's slice
+                     * of the bounded working set. */
+                    base_page = slice_lo + (GetNextRandom(&thread_rng) % slice);
+                    run_left  = MIN_RUN_PAGES +
+                                (GetNextRandom(&thread_rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
+
+                    hot[hot_next].base = base_page;
+                    hot[hot_next].len  = run_left;
                     hot_next = (hot_next + 1) % HOT_SPOTS;
                     if (hot_count < HOT_SPOTS) hot_count++;
                 }
 
-                run_left = MIN_RUN_PAGES +
-                           (GetNextRandom(&thread_rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
-
+                /* clamp to the VA end */
+                if (base_page >= total_pages) base_page = 0;
                 if (base_page + run_left > total_pages) {
                     run_left = total_pages - base_page;
-                    if (run_left == 0) {
-                        base_page = 0;
-                        run_left  = MIN_RUN_PAGES;
-                    }
+                    if (run_left == 0) { base_page = 0; run_left = MIN_RUN_PAGES; }
                 }
 
                 cur_page = base_page;
@@ -225,30 +267,20 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
         }
 
         if (page_faulted) {
-            // workload: instead of handle_page_fault(va), when mid-run:
             handle_page_fault(arbitrary_va);
             continue;   /* retry the SAME va -- do not advance */
         }
 
-        // If we didnt fault
         {
-            // Get the pte
             PPTE pte = get_pte_from_va(arbitrary_va);
-
-            // We need a ulong64 so we can actually pass those bits into the interlock
             ULONG64 old_val = *(volatile ULONG64*)pte;
-
-            // But we also need a real pte so we can read it using the fields
             PTE snapshot;
             *(PULONG64)&snapshot = old_val;
 
-            // Only do this if we actually didn't fault and nobody else set the age for us
             if (snapshot.hardware.valid == 1 && snapshot.hardware.age == 0) {
                 PTE updated = snapshot;
                 updated.hardware.age = 1;
-                // LK check return value to see if failed
-
-                InterlockedCompareExchange64(( LONG64*)pte,
+                InterlockedCompareExchange64((LONG64*)pte,
                                              *(PLONG64)&updated,
                                              (LONG64)old_val);
             }
@@ -257,7 +289,6 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
         cur_page++;
         run_left--;
         resolved = TRUE;
-
 
         if (i > 0 && i % (runtime / 100) == 0) {
             DIAG_PRINT(".");

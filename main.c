@@ -352,12 +352,12 @@ full_virtual_memory_test(VOID) {
     DIAG_PRINT("demand-zero: total=%lld | from_zerolist=%lld pristine=%lld dirty=%lld\n",
            g_hard_faults_zero, g_dz_from_zerolist, g_dz_pristine, g_dz_dirty);
 
-    // DIAG_PRINT("phys=%u free=%lld standby=%lld modified=%lld active(est)=%lld\n",
-    //    NUMBER_OF_PHYSICAL_PAGES,
-    //    pfn_free_list.count, pfn_standby_list.count, pfn_modified_list.count,
-    //    (LONG64)NUMBER_OF_PHYSICAL_PAGES - pfn_free_list.count
-    //        - pfn_standby_list.count - pfn_modified_list.count);
-    //
+    DIAG_PRINT("phys=%u free=%lld standby=%lld modified=%lld active(est)=%lld\n",
+       NUMBER_OF_PHYSICAL_PAGES,
+       pfn_free_list.count, standby_total_count(), pfn_modified_list.count,
+       (LONG64)NUMBER_OF_PHYSICAL_PAGES - pfn_free_list.count
+           - standby_total_count() - pfn_modified_list.count);
+
     // LARGE_INTEGER freq;
     // QueryPerformanceFrequency(&freq);
     // DIAG_PRINT("lock_wait total: %.1f ms\n",

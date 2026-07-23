@@ -388,11 +388,21 @@ collect_from_bin(PPTE_REGION region, PLIST_ENTRY head,
                  ULONG64* saved_frames, int* n, int batch_size) {
     while (!IsListEmpty(head) && *n < batch_size) {
         PLIST_ENTRY entry = RemoveHeadList(head);
-        entry->Flink = NULL;
-        entry->Blink = NULL;
-
+        entry->Flink = NULL; entry->Blink = NULL;
         pfn_metadata* candidate = GetPfnFromListEntry(entry);
+
+        lock_pfn(candidate);                              /* read state consistently */
         PPTE evict_pte = candidate->pte;
+        BOOL harvestable = (evict_pte != NULL &&
+                            evict_pte->hardware.valid == 1 &&
+                            candidate->isOccupied == 1 &&
+                            candidate->isBeingWrittenToDisc == 0 &&      /* NOT in disc pipeline */
+                            get_pte_lock_from_pte_pointer(evict_pte) == &region->lock);
+        unlock_pfn(candidate);
+
+        if (!harvestable) {
+            continue;   /* already unlinked; drop -- disc worker or someone else owns it */
+        }
 
         /* only harvest genuinely active pages owned by THIS region */
         if (evict_pte == NULL ||
@@ -418,6 +428,7 @@ get_unmap_candidates(int* batch_count, int batch_size) {
     ULONG64 regions_checked = 0;
     *batch_count = 0;
 
+    /* ---- PASS 1: bins 7..1, per-region batched harvest + unmap ---- */
     while (*batch_count < batch_size && regions_checked < num_pte_regions) {
         PPTE_REGION region = &pte_regions[current_trim_region];
 
@@ -428,22 +439,20 @@ get_unmap_candidates(int* batch_count, int batch_size) {
             ULONG64       saved_frames[MAX_TRIM_PAGES];
             int           n = 0;
 
-            /* collect across all bins of THIS region into one array */
             for (int age = 7; age >= 1 && n < batch_size; age--) {
                 collect_from_bin(region, &region->active_age_lists[age],
                                  candidates, unmap_vas, saved_frames, &n, batch_size);
             }
 
             if (n > 0) {
-                /* ONE scatter unmap for the whole region's harvest, still
-                 * under region->lock -- no faulting thread can touch these
-                 * VAs because they'd need this same lock. */
                 if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
-                    printf("CRITICAL: batch unmap failed n=%d err=%lu\n", n, GetLastError());
-                    DebugBreak();
-                    /* mappings still live -- put pages back, stamp nothing */
+                    DIAG_PRINT("CRITICAL: batch unmap failed n=%d err=%lu\n", n, GetLastError());
+                    VMM_ASSERT(0, "batch unmap failed\n");
+                    /* mappings still live -- put pages back on bin 0, stamp nothing */
                     for (int i = 0; i < n; i++) {
+                        lock_pfn(candidates[i]);
                         InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
+                        unlock_pfn(candidates[i]);
                     }
                     n = 0;
                 }
@@ -452,21 +461,37 @@ get_unmap_candidates(int* batch_count, int batch_size) {
                 /* stamp PTEs to TRANSITION + publish to modified list */
                 for (int i = 0; i < n; i++) {
                     pfn_metadata* c = candidates[i];
+
+                    lock_pfn(c);
+                    /* Recheck under the page lock: collect_from_bin checked
+                     * bwd/occ earlier then RELEASED the lock. The disc worker or
+                     * a rescue may have claimed the frame in that window. If so,
+                     * it's off the age list already -- don't stamp, don't insert. */
+                    if (c->isBeingWrittenToDisc != 0 || c->isOccupied != 1) {
+                        unlock_pfn(c);
+                        continue;
+                    }
+
+                    /* stamp the PTE to transition (frame still ours) */
                     PPTE evict_pte = c->pte;
                     *(PULONG64)evict_pte = 0;
                     evict_pte->transition.valid        = 0;
                     evict_pte->transition.transition   = 1;
                     evict_pte->transition.frame_number = saved_frames[i];
 
-                    lock_pfn(c);
+                    /* real double-insert guard: BEFORE the insert, Flink must be NULL */
+                    VMM_ASSERT(c->list.Flink == NULL && c->list.Blink == NULL,
+                               "modified insert: frame ALREADY linked! pfn=%p Flink=%p occ=%d bwd=%d\n",
+                               c, c->list.Flink, (int)c->isOccupied, (int)c->isBeingWrittenToDisc);
+
+                    /* occ=2 and the insert are ATOMIC under the page lock */
                     c->isOccupied = 2;
-                    unlock_pfn(c);
                     LockedInsertTail(&pfn_modified_list, &c->list);
+                    unlock_pfn(c);
                 }
 
                 *batch_count += n;
             }
-
             LeaveCriticalSection(&region->lock);
         }
 
@@ -474,13 +499,14 @@ get_unmap_candidates(int* batch_count, int batch_size) {
         regions_checked++;
     }
 
-    /* Pass 2 (last resort): bin 0, same per-region batching. Only if nothing
-     * was found in bins 7..1 across the whole sweep. */
+    /* ---- PASS 2 (last resort): bin 0, only if bins 7..1 yielded nothing ---- */
     if (*batch_count == 0) {
         regions_checked = 0;
         while (*batch_count < batch_size && regions_checked < num_pte_regions) {
             PPTE_REGION region = &pte_regions[current_trim_region];
+
             if (TryEnterCriticalSection(&region->lock)) {
+
                 pfn_metadata* candidates[MAX_TRIM_PAGES];
                 PVOID         unmap_vas[MAX_TRIM_PAGES];
                 ULONG64       saved_frames[MAX_TRIM_PAGES];
@@ -491,74 +517,48 @@ get_unmap_candidates(int* batch_count, int batch_size) {
 
                 if (n > 0) {
                     if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
-                        DebugBreak();
-                        for (int i = 0; i < n; i++)
+                        DIAG_PRINT("CRITICAL: batch unmap failed (bin0) n=%d err=%lu\n", n, GetLastError());
+                        VMM_ASSERT(0, "batch unmap failed bin0\n");
+                        for (int i = 0; i < n; i++) {
+                            lock_pfn(candidates[i]);
                             InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
+                            unlock_pfn(candidates[i]);
+                        }
                         n = 0;
                     }
                     DIAG_ADD(g_trim_unmaps, n);
+
                     for (int i = 0; i < n; i++) {
                         pfn_metadata* c = candidates[i];
+
+                        lock_pfn(c);
+                        if (c->isBeingWrittenToDisc != 0 || c->isOccupied != 1) {
+                            unlock_pfn(c);
+                            continue;
+                        }
+
                         PPTE evict_pte = c->pte;
                         *(PULONG64)evict_pte = 0;
                         evict_pte->transition.valid        = 0;
                         evict_pte->transition.transition   = 1;
                         evict_pte->transition.frame_number = saved_frames[i];
 
-                        LeaveCriticalSection(&region->lock);
+                        VMM_ASSERT(c->list.Flink == NULL && c->list.Blink == NULL,
+                                   "modified insert (bin0): frame ALREADY linked! pfn=%p Flink=%p occ=%d bwd=%d\n",
+                                   c, c->list.Flink, (int)c->isOccupied, (int)c->isBeingWrittenToDisc);
+
+                        c->isOccupied = 2;
+                        LockedInsertTail(&pfn_modified_list, &c->list);
+                        unlock_pfn(c);
                     }
 
-                    current_trim_region = (current_trim_region + 1) % num_pte_regions;
-                    regions_checked++;
+                    *batch_count += n;
                 }
-
-                /* Pass 2 (last resort): bin 0, same per-region batching. Only if nothing
-                 * was found in bins 7..1 across the whole sweep. */
-                if (*batch_count == 0) {
-                    regions_checked = 0;
-                    while (*batch_count < batch_size && regions_checked < num_pte_regions) {
-                        PPTE_REGION region = &pte_regions[current_trim_region];
-                        if (TryEnterCriticalSection(&region->lock)) {
-
-                            pfn_metadata* candidates[MAX_TRIM_PAGES];
-                            PVOID         unmap_vas[MAX_TRIM_PAGES];
-                            ULONG64       saved_frames[MAX_TRIM_PAGES];
-                            int           n = 0;
-
-                            collect_from_bin(region, &region->active_age_lists[0],
-                                             candidates, unmap_vas, saved_frames, &n, batch_size);
-
-                            if (n > 0) {
-                                if (MapUserPhysicalPagesScatter(unmap_vas, n, NULL) == FALSE) {
-                                    DebugBreak();
-                                    for (int i = 0; i < n; i++)
-                                        InsertTailList(&region->active_age_lists[0], &candidates[i]->list);
-                                    n = 0;
-                                }
-                                DIAG_ADD(g_trim_unmaps, n);
-                                for (int i = 0; i < n; i++) {
-                                    pfn_metadata* c = candidates[i];
-                                    PPTE evict_pte = c->pte;
-                                    *(PULONG64)evict_pte = 0;
-                                    evict_pte->transition.valid        = 0;
-                                    evict_pte->transition.transition   = 1;
-                                    evict_pte->transition.frame_number = saved_frames[i];
-                                    lock_pfn(c);
-                                    c->isOccupied = 2;
-                                    unlock_pfn(c);
-                                    LockedInsertTail(&pfn_modified_list, &c->list);
-                                    VMM_ASSERT(c->list.Flink == NULL && c->list.Blink == NULL,
-                       "modified insert: frame still linked! pfn=%p Flink=%p\n", c, c->list.Flink);
-                                }
-                                *batch_count += n;
-                            }
-                            LeaveCriticalSection(&region->lock);
-                        }
-                        current_trim_region = (current_trim_region + 1) % num_pte_regions;
-                        regions_checked++;
-                    }
-                }
+                LeaveCriticalSection(&region->lock);
             }
+
+            current_trim_region = (current_trim_region + 1) % num_pte_regions;
+            regions_checked++;
         }
     }
 }
