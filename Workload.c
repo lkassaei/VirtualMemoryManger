@@ -271,18 +271,27 @@ full_virtual_memory_test_helper_not_random(int thread_number) {
             continue;   /* retry the SAME va -- do not advance */
         }
 
+        /* Mark the page referenced. Retry on CAS failure -- a lost set is a false
+ * "cold" reading that mis-promotes a hot page. Bounded: after a few failures
+ * the PTE is being hammered, and one lost sample is not worth spinning. */
         {
             PPTE pte = get_pte_from_va(arbitrary_va);
-            ULONG64 old_val = *(volatile ULONG64*)pte;
-            PTE snapshot;
-            *(PULONG64)&snapshot = old_val;
+            for (int attempt = 0; attempt < 4; attempt++) {
+                ULONG64 old_val = *(volatile ULONG64*)pte;
+                PTE snapshot; *(PULONG64)&snapshot = old_val;
 
-            if (snapshot.hardware.valid == 1 && snapshot.hardware.age == 0) {
+                if (snapshot.hardware.valid != 1) break;   /* trimmed under us; nothing to mark */
+                if (snapshot.hardware.age  == 1) break;    /* already marked; done */
+
                 PTE updated = snapshot;
                 updated.hardware.age = 1;
-                InterlockedCompareExchange64((LONG64*)pte,
-                                             *(PLONG64)&updated,
-                                             (LONG64)old_val);
+
+                if (InterlockedCompareExchange64((volatile LONG64*)pte,
+                                                 *(PLONG64)&updated,
+                                                 (LONG64)old_val) == (LONG64)old_val) {
+                    break;   /* success */
+                                                 }
+                /* CAS failed: PTE changed. Re-read and re-decide. */
             }
         }
 

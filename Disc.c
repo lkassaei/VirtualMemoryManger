@@ -24,30 +24,77 @@ create_page_file(PULONG64 number_of_pages) {
     }
     *number_of_pages = num_bytes / PAGE_SIZE;
 
-    disc_metadata = malloc(*number_of_pages * sizeof(DISC_METADATA));
-    if (disc_metadata == NULL) {
-        printf("could not allocate disc_metadata and fake disc\n");
-        _aligned_free(p);
+    disc_bitmap_words = DISC_BITMAP_WORDS(disc_page_count);
+    disc_bitmap = (volatile LONG64*)zero_malloc(disc_bitmap_words * sizeof(LONG64));
+    if (disc_bitmap == NULL) {
+        printf("CRITICAL: could not allocate disc bitmap\n");
         return NULL;
     }
-    memset(disc_metadata, 0, *number_of_pages * sizeof(DISC_METADATA));
 
-    for (ULONG64 i = 0; i < *number_of_pages; i++) {
-        disc_metadata[i].index      = i;
-        disc_metadata[i].isOccupied = FALSE;
-        LockedInsertTail(&disc_free_list, &disc_metadata[i].list);
+    /* The last word may cover slots past disc_page_count. Pre-mark those bits
+     * OCCUPIED so the allocator can never hand out an out-of-range slot. */
+    for (ULONG64 b = disc_page_count; b < disc_bitmap_words * 64; b++) {
+        disc_bitmap[b >> 6] |= (1LL << (b & 63));
     }
+    g_disc_free_count = (LONG64)disc_page_count;
 
     return p;
 }
 
+/* Per-thread scan cursor. This is what actually delivers parallel allocation:
+ * without it every thread scans from word 0 and they collide on the same bits
+ * and the same cache line. With it, threads claim in different words. */
+static __declspec(thread) ULONG64 t_disc_hint = 0;
+
 ULONG64
-find_free_disc_slot(VOID) {
-    PLIST_ENTRY e = LockedRemoveHead(&disc_free_list);
-    if (e == NULL) return INVALID_DISC_SLOT;
-    PDISC_METADATA meta = CONTAINING_RECORD(e, DISC_METADATA, list);
-    meta->isOccupied = TRUE;
-    return meta->index;
+find_free_disc_slot(void) {
+    if (disc_bitmap_words == 0) return INVALID_DISC_SLOT;
+
+    ULONG64 start = t_disc_hint;
+    if (start >= disc_bitmap_words) start = 0;
+
+    for (ULONG64 pass = 0; pass < disc_bitmap_words; pass++) {
+        ULONG64 w = start + pass;
+        if (w >= disc_bitmap_words) w -= disc_bitmap_words;
+
+        for (;;) {
+            /* Plain read is fine: the BTS below re-verifies atomically, so a
+             * stale word only costs one wasted attempt. */
+            LONG64 word = disc_bitmap[w];
+            if ((ULONG64)word == ~0ULL) break;      /* word full -> next word */
+
+            unsigned long bit;
+            _BitScanForward64(&bit, (unsigned __int64)(~(unsigned __int64)word));
+
+            /* lock bts: returns the PREVIOUS bit. 0 means we flipped it 0->1,
+             * so the slot is exclusively ours. */
+            if (_interlockedbittestandset64(&disc_bitmap[w], (LONG64)bit) == 0) {
+                t_disc_hint = w;
+                InterlockedDecrement64(&g_disc_free_count);
+                return (w << 6) + bit;
+            }
+            /* lost the race for that bit -- re-read the word and try again.
+             * Terminates: every failure means the word gained a set bit. */
+        }
+    }
+    return INVALID_DISC_SLOT;   /* disc full */
+}
+
+VOID
+free_disc_slot(ULONG64 slot) {
+    VMM_ASSERT(slot < disc_page_count,
+               "free_disc_slot: slot %llu out of range (count=%llu)\n", slot, disc_page_count);
+
+    ULONG64 w   = slot >> 6;
+    LONG64  bit = (LONG64)(slot & 63);
+
+    /* lock btr: returns the PREVIOUS bit. It must have been 1 -- a 0 means
+     * this slot was freed twice, which would let two owners share it. */
+    unsigned char was_set = _interlockedbittestandreset64(&disc_bitmap[w], bit);
+    VMM_ASSERT(was_set, "free_disc_slot: DOUBLE FREE of slot %llu\n", slot);
+
+    InterlockedIncrement64(&g_disc_free_count);
+    t_disc_hint = w;   /* next alloc on this thread reuses a warm word */
 }
 
 /* Batched write: one MapUserPhysicalPages for the whole batch into the

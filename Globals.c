@@ -50,16 +50,18 @@ volatile LONG64 g_dz_pristine = 0;
 volatile LONG64 g_dz_dirty = 0;
 
 /* ---- controller state (for dynamic trimmer) ---- */
-volatile LONG64 g_fault_stalls = 0;
-ULONG64 g_trim_target = 0;
+volatile ULONG64 g_trim_target  = 0;    /* init in set_up_program */
+volatile LONG64  g_fault_stalls = 0;
 
 /* ---- disc ---- */
 PVOID           disc               = NULL;
 PVOID           temp_disc_va_start = NULL;
-PDISC_METADATA  disc_metadata      = NULL;
 LOCKED_LIST     disc_free_list;
 CRITICAL_SECTION disc_lock;
 ULONG64         disc_page_count    = 0;
+volatile LONG64* disc_bitmap       = NULL;
+ULONG64          disc_bitmap_words = 0;
+volatile LONG64  g_disc_free_count = 0;
 
 /* ---- events ---- */
 HANDLE  StandbyPageAvailableEvent = NULL;

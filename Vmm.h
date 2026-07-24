@@ -58,6 +58,8 @@
 #define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
 #define INVALID_DISC_SLOT ((1ULL << MAX_DISC_PTE_BITS) - 1)
 
+#define DISC_BITMAP_WORDS(n)  (((n) + 63) / 64)
+
 #define DISC_BATCH 256                       // was 64 — amortize the map/unmap syscalls
 #define MAX_TRIM_PAGES 256                   // match DISC_BATCH so one harvest = one disc batch
 #define LOWEST_PAGES (NUMBER_OF_PHYSICAL_PAGES / 64)     // ~4,096: wake trim earlier
@@ -110,6 +112,12 @@
 #define WORKING_SET_DIVISOR 1 // Make bigger for max performance
 #define REVISIT_CHANCE      2      /* was 4 */
 #define RECENT_BIAS         1    /* all revisits target the newest spots */
+
+#define PAGER_PERIOD_MS         20    /* wake at least this often: aging must
+* keep running even when not starving  */
+#define PER_REGION_HARVEST_MAX  64    /* cap pages taken from any one region so
+* one region cannot dominate a pass     */
+#define REGIONS_PER_PASS_STEP    8
 
 /* ============================================================================
  *  Diagnostics + safety switches.
@@ -229,17 +237,6 @@ typedef struct _PTE_REGION {
     ULONG64 active_page_count; // Tracks how many active pages are in this region
 } PTE_REGION, *PPTE_REGION;
 
-
-/* -------------------------------------------------------------------------
- *  disc_metadata
- * ------------------------------------------------------------------------- */
-typedef struct _DISC_METADATA {
-    LIST_ENTRY list;
-    ULONG64 index;
-    BOOL isOccupied;
-} DISC_METADATA, *PDISC_METADATA;
-
-
 /* -------------------------------------------------------------------------
  *  THREAD_RNG_STATE  --  per-thread PRNG state used by the workload.
  * ------------------------------------------------------------------------- */
@@ -282,10 +279,11 @@ extern LOCKED_LIST   pfn_standby_shards[STANDBY_SHARDS];
 /* ---- disc ---- */
 extern PVOID          disc;               /* the buffer (standardized name) */
 extern PVOID          temp_disc_va_start; /* DISC_BATCH-page scratch window  */
-extern PDISC_METADATA disc_metadata;
-extern LOCKED_LIST    disc_free_list;
 extern CRITICAL_SECTION disc_lock;
 extern ULONG64        disc_page_count;    /* actual size from create_page_file */
+extern volatile LONG64* disc_bitmap;        /* 1 bit per slot: 1 = occupied */
+extern ULONG64          disc_bitmap_words;
+extern volatile LONG64  g_disc_free_count;  /* approximate; diagnostics + low-disc checks */
 
 /* ---- events ---- */
 extern HANDLE  StandbyPageAvailableEvent;
@@ -314,8 +312,8 @@ extern volatile LONG64 g_dz_dirty;
 
 
 /* ---- controller state (for dynamic trimmer) ---- */
-extern volatile LONG64 g_fault_stalls;
-extern ULONG64 g_trim_target;
+extern volatile ULONG64 g_trim_target;
+extern volatile LONG64  g_fault_stalls;
 
 
 /* ============================================================================
@@ -405,6 +403,7 @@ VOID          ensure_metadata_slot_is_committed(pfn_metadata *table_base,
 /* --- disc.c --- */
 PVOID   create_page_file(PULONG64 number_of_pages);
 ULONG64 find_free_disc_slot(VOID);
+VOID free_disc_slot(ULONG64 slot);
 VOID    write_to_disc(pfn_metadata** candidates, ULONG64 batch_count);
 
 

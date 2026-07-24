@@ -357,10 +357,7 @@ DiscThreadWorker(LPVOID lpParam) {
 
                 free_slot:
                     if (slot_to_free != INVALID_DISC_SLOT) {
-                        EnterCriticalSection(&disc_lock);
-                        disc_metadata[slot_to_free].isOccupied = FALSE;
-                        LeaveCriticalSection(&disc_lock);
-                        LockedInsertTail(&disc_free_list, &disc_metadata[slot_to_free].list);
+                        free_disc_slot(slot_to_free);
                     }
                 }
 

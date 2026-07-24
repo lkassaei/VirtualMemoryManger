@@ -111,7 +111,7 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
         if (target_pfn == NULL) {
             SetEvent(LowPagesEvent);
-            DIAG_COUNT(g_fault_stalls);      /* controller signal */
+            // DIAG_COUNT(g_fault_stalls);      /* controller signal */
             LeaveCriticalSection(my_pte_lock);
             while (pfn_free_list.count == 0 && standby_total_count() == 0) {
                 WaitForSingleObject(StandbyPageAvailableEvent, 10);   /* NOT INFINITE */
@@ -278,10 +278,7 @@ handle_hard_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
 
         /* 2. fill from disc, free the disc slot */
         memcpy(staging_va, (char*)disc + (my_disc_slot * PAGE_SIZE), PAGE_SIZE);
-        EnterCriticalSection(&disc_lock);
-        disc_metadata[my_disc_slot].isOccupied = FALSE;
-        LeaveCriticalSection(&disc_lock);
-        LockedInsertTail(&disc_free_list, &disc_metadata[my_disc_slot].list);
+        free_disc_slot(my_disc_slot);
 
         /* 3. NO unmap here -- deferred to flush_staging_ring(). */
 
@@ -364,10 +361,7 @@ handle_soft_fault(PPTE pte, PVOID arbitrary_va, CRITICAL_SECTION* my_pte_lock) {
     unlock_pfn(target_pfn);
 
     if (slot_to_free != INVALID_DISC_SLOT) {
-        EnterCriticalSection(&disc_lock);
-        disc_metadata[slot_to_free].isOccupied = FALSE;
-        LeaveCriticalSection(&disc_lock);
-        LockedInsertTail(&disc_free_list, &disc_metadata[slot_to_free].list);
+        free_disc_slot(slot_to_free);
     }
 
     PVOID va_aligned = (PVOID)((ULONG_PTR)arbitrary_va & ~((ULONG_PTR)PAGE_SIZE - 1));

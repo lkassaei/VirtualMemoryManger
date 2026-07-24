@@ -115,7 +115,6 @@ BOOL
 set_up_program(VOID) {
     InitializeLockedList(&pfn_free_list);
     InitializeLockedList(&pfn_modified_list);
-    InitializeLockedList(&disc_free_list);
     InitializeLockedList(&pfn_zeroed_list);
     for (int i = 0; i < STANDBY_SHARDS; i++) {
         InitializeLockedList(&pfn_standby_shards[i]);   /* whatever your init is */
@@ -244,6 +243,8 @@ set_up_program(VOID) {
         }
     }
 
+    g_trim_target = NUMBER_OF_PHYSICAL_PAGES / 64;   /* start at the floor */
+
     /* ---- the user VA space ---- */
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
     MEM_EXTENDED_PARAMETER parameter = { 0 };
@@ -306,11 +307,15 @@ full_virtual_memory_test(VOID) {
     HANDLE threads[NUM_WORKER_THREADS + 4] = { NULL };
 
     threads[NUM_WORKER_THREADS + 0] = CreateThread(NULL, 0, TrimThreadWorker, NULL, 0, NULL);
-    threads[NUM_WORKER_THREADS + 1] = CreateThread(NULL, 0, DiscThreadWorker, NULL, 0, NULL);
-    threads[NUM_WORKER_THREADS + 2] = CreateThread(NULL, 0, AgeThreadWorker,  NULL, 0, NULL);
+    threads[NUM_WORKER_THREADS + 1] = CreateThread(NULL, 0, AgeThreadWorker,  NULL, 0, NULL);
+    threads[NUM_WORKER_THREADS + 2] = CreateThread(NULL, 0, DiscThreadWorker, NULL, 0, NULL);
     threads[NUM_WORKER_THREADS + 3] = CreateThread(NULL, 0, ZeroThreadWorker, NULL, 0, NULL);
 
-    /* Main runs helper(0) inline, so created workers take VA-thread-numbers 1..N. */
+    for (int t = 0; t < NUM_WORKER_THREADS + 4; t++) {
+        VMM_ASSERT(threads[t] != NULL || t < NUM_WORKER_THREADS,
+                   "background thread slot %d failed, err=%lu\n", t, GetLastError());
+    }
+
     for (int i = 0; i < NUM_WORKER_THREADS; i++) {
         threads[i] = CreateThread(NULL, 0,
                                   (LPTHREAD_START_ROUTINE)full_virtual_memory_test_helper_not_random,
